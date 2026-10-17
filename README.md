@@ -34,7 +34,7 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 ## Verification status (what was really run, what was not)
 | Item | Status |
 |---|---|
-| `npm run lint`, `npm run scan`, `npm test` (80 tests) | **Run locally, green** (Node 22.22). Not yet confirmed on GitHub Actions at the time of writing — see the PR checks. |
+| `npm run lint`, `npm run scan`, `npm test` (80 tests) | **Run locally, green** (Node 22.22). GitHub Actions (`Tests` workflow) also passed on commit `8383bae`. |
 | Real Claude invocation on an isolated test repo, objective → delegation → execution → report → CTO control → verified commit | **Run, succeeded** — evidence in [docs/DEMO_EVIDENCE.md](docs/DEMO_EVIDENCE.md) |
 | Correction loop | Covered by tests with scripted agent doubles that modify real worktrees. **Not triggered in the live run** (the agent passed first time). |
 | Restart recovery, cancellation, retries, budget stop, approval gates, concurrency limit | Covered by tests (real git worktrees, real files; agents scripted) |
