@@ -1,0 +1,34 @@
+:root {
+  --bg: #0f1218; --panel: #181d27; --line: #2a3242; --text: #e6e9ef; --muted: #98a2b3;
+  --ok: #3fb97f; --warn: #e0a23a; --bad: #e5594f; --info: #4c8dff;
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 12px 20px; border-bottom: 1px solid var(--line); }
+h1 { font-size: 18px; margin: 0; }
+h1 small { color: var(--muted); font-weight: 400; }
+h2 { font-size: 15px; margin: 0 0 8px; }
+main { display: grid; gap: 16px; padding: 16px 20px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+#missions-panel { grid-column: 1 / -1; }
+section, .mission { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+.mission { margin-bottom: 12px; }
+input, textarea, button { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+textarea, #project { width: 100%; margin-bottom: 6px; }
+button { cursor: pointer; background: #222a38; }
+button:hover { border-color: var(--info); }
+button.danger:hover { border-color: var(--bad); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+#banner { margin: 12px 20px 0; padding: 8px 12px; border-radius: 6px; border: 1px solid var(--bad); background: #2a1514; }
+#banner.info { border-color: var(--info); background: #14203a; }
+ul { list-style: none; margin: 0; padding: 0; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; border: 1px solid var(--line); }
+.badge.completed, .badge.done, .badge.accepted { color: var(--ok); border-color: var(--ok); }
+.badge.running, .badge.approved { color: var(--info); border-color: var(--info); }
+.badge.awaiting_owner, .badge.review, .badge.pending_approval, .badge.queued, .badge.waiting { color: var(--warn); border-color: var(--warn); }
+.badge.blocked, .badge.failed, .badge.cancelled, .badge.rejected { color: var(--bad); border-color: var(--bad); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0; }
+.muted { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; margin: 6px 0; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+pre { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; max-height: 220px; overflow: auto; }
+details { margin-top: 6px; }

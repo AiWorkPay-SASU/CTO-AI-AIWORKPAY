@@ -1,11 +1,38 @@
-# CTO IA architecture v0.1
-## Boundaries
-Owner -> CTO API -> mission planner -> durable job queue -> isolated Claude Code specialists -> QA/security review -> human approval -> GitHub PR. Supabase stores projects, missions, tasks, events, reports, approvals and cost ledger. MissionControl reads the API, never Supabase service credentials.
+# CTO IA architecture v0.2
+
+## Flow
+Owner → HTTP API / MissionControl → **Cto** (planner, dispatcher, verifier) → **JobQueue** (durable leases) →
+isolated Claude Code specialists (one git worktree per task) → CTO verification (git evidence, tests re-run by the CTO,
+owner acceptance tests, secret scan) → owner approval → branch + PR body. Supabase (or the local file store) keeps
+missions, tasks, reports, append-only events, approvals and the cost ledger.
+
+## Modules
+| File | Role |
+|---|---|
+| `src/core.js` | Mission/task state machines, role definitions (tool allowlists, budgets), report contract |
+| `src/cto.js` | Orchestrator: plan, approvals, dispatch, verification, corrections, escalation, consolidated report |
+| `src/queue.js` | Durable queue: leases, heartbeat, retry with backoff, restart recovery, cancellation, approval/dependency gates |
+| `src/runner.js` | Real `claude -p` adapter: stdin prompt, tool allowlist + denylist, `--max-budget-usd`, timeout, abort, sanitized env |
+| `src/workspace.js` | Worktree isolation, git evidence, acceptance tests, test runner, forbidden paths |
+| `src/agents.js` | System prompts, fenced/sanitized instructions, plan contract |
+| `src/store/` | `FileStore` (single process, dev/test) and `SupabaseStore` (PostgREST via `fetch`, optimistic locking) |
+| `src/server.js`, `public/` | HTTP API (tokens, rate limit, headers) and MissionControl UI |
+
 ## State model
-Mission: pending_approval -> approved -> running -> review -> completed; blocked and cancelled states supported. A task can start only when dependencies have succeeded and its required approval is recorded.
-## Isolation
-One workspace/worktree per task, least-privilege repository permissions, secret redaction, command allowlist and strict timeouts. Never let agent output directly authorize a sensitive action.
-## Agents
-First wave: architect (design/review) and backend (implementation/test). Next: frontend, QA, security, DevOps.
-## Risks to resolve
-CLI process isolation, concurrency and recovery, secure user authentication, cost accounting, real audit events, reliable idempotency, rate limiting, Supabase RLS, missing source specifications.
+Mission: `pending_approval → approved → running → awaiting_owner → running → review → completed`;
+`blocked`, `failed`, `cancelled` are reachable where it makes sense (see `MISSION_TRANSITIONS`).
+Task: `waiting → queued → running → review → done` (`review → queued` = correction round).
+Owner approvals are explicit records (`mission`, `architecture`, `completion`); the queue refuses to dispatch the backend
+task without a recorded `architecture` approval and a `done` architect task, even if the task was queued by mistake.
+
+## Isolation and safety
+- One worktree per task (`cto/<mission8>/<role>-<task8>`), reused across correction rounds; the architect's is detached and read-only.
+- Agent environment is an allowlist: GitHub, Supabase and admin credentials are never forwarded.
+- Tool allowlist per role; `bypassPermissions`, git, network and package managers are denied.
+- Prompts fence untrusted text (`<objective>`, `<approved_plan>`, `<review_feedback>`) and strip secrets; reports and events are redacted.
+- Forbidden paths (`.github/`, `.env*`, `SECURITY.md`, `AGENTS.md`) and secret-like diffs are rejected.
+- Budget is checked before every dispatch; exceeding it blocks the mission and escalates.
+
+## Known limits (see README "Verification status")
+Static owner/viewer tokens (no per-user auth), `FileStore` is single-process, the concurrency check is not atomic across
+several worker processes, Supabase migration not applied to any project, no TLS termination.

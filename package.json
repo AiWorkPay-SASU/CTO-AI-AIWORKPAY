@@ -1,15 +1,19 @@
 {
   "name": "cto-ai-missioncontrol",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "private": true,
+  "description": "CTO IA multi-agent software team: orchestrator, isolated Claude Code specialists, MissionControl.",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test --test-reporter=spec test/*.test.js",
+    "lint": "node scripts/lint.js",
+    "scan": "node scripts/scan-secrets.js",
+    "check": "npm run lint && npm run scan && npm test",
+    "demo": "node scripts/demo.js"
   },
   "engines": {
     "node": ">=20"
   },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.49.0"
-  }
+  "dependencies": {}
 }

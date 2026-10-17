@@ -16,5 +16,16 @@ Node HTTP API, CTO planner, architect/backend role descriptors, Supabase migrati
 10. Add full CI including lint/typecheck/security checks; document setup, smoke test evidence, limitations and release checklist.
 ## Definition of done
 Real Claude invocation on isolated test repo; persisted mission and report; verified approvals; tests green; MissionControl reflects actual status; no production deployment; PR reviewed by owner.
-## Current caveats
-The UI is a minimal console, not a complete dashboard. Current dispatch is not connected to API. No live Claude execution, Supabase migration or CI pass has been verified.
+## Status after MVP v0.2
+Done and verified locally: durable queue with leases/retries/recovery, approval gates (mission → architecture → completion), isolated worktrees,
+real Claude runner, CTO-side verification (git evidence, tests re-run, owner acceptance tests, secret/forbidden-path checks), cost ledger and budget stop,
+append-only audit events, consolidated report + PR body, HTTP API with tokens/rate limit/headers, MissionControl UI, 80 automated tests, real demo (docs/DEMO_EVIDENCE.md).
+
+Still open (do not claim otherwise):
+1. Apply and test `supabase/migrations/001_init.sql` on a **dedicated dev project** (none exists; `zeeroo` is unrelated). Test RLS denial for `anon`/`authenticated`, and run `SupabaseStore` against it.
+2. Replace the two static tokens by real authenticated users + roles before any public hosting; add TLS.
+3. Make the concurrency limit atomic across worker processes (DB lock) before scaling out; `FileStore` is single-process.
+4. Add frontend, QA, security and DevOps specialists; independent QA/security review agent for high-risk missions.
+5. Open the GitHub PR automatically from a verified branch (needs an owner-approved credential scope).
+6. Exercise MissionControl in a real browser; add dependency/SAST steps to CI if dependencies are introduced.
+7. Fill docs/01…06 with real, approved specifications.
