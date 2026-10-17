@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { planMission, validateTransition, validateReport, ROLES, TERMINAL_MISSION } from './core.js';
+import { planMission, validateTransition, validateReport, ROLES, TERMINAL_MISSION, REVIEWER_ROLES } from './core.js';
 import { JobQueue } from './queue.js';
 import { emit } from './events.js';
 import { runClaude } from './runner.js';
-import { buildInstruction, systemPromptFor, validatePlan } from './agents.js';
+import { buildInstruction, systemPromptFor, validatePlan, validateReview } from './agents.js';
 import {
   ensureWorkspace, removeWorkspace, collectEvidence, forbiddenChanges, commitAll,
-  writeAcceptance, clearAcceptance, runTests, resetWorkspace
+  writeAcceptance, clearAcceptance, runTests, resetWorkspace, branchSummary
 } from './workspace.js';
 import { redact, nowIso, sleep } from './util.js';
 
@@ -51,6 +51,7 @@ export class Cto {
     });
     this.controllers = new Map();
     this.inflight = new Set();
+    this.deciding = new Set();
     this.timer = null;
   }
 
@@ -134,7 +135,8 @@ export class Cto {
     if (kind === 'architecture') {
       await this.#setMission(mission, 'running');
       const tasks = await this.store.list('tasks', { mission_id: missionId });
-      for (const t of tasks.filter((x) => x.status === 'waiting')) {
+      // Only the task gated by this approval is released; reviewers wait for a verified backend commit.
+      for (const t of tasks.filter((x) => x.status === 'waiting' && x.requires_approval === 'architecture')) {
         await this.store.cas('tasks', t.id, { status: 'waiting' }, { status: 'queued' });
       }
     }
@@ -245,6 +247,11 @@ export class Cto {
     return plan?.artifact_text ?? null;
   }
 
+  async #latestBackend(missionId) {
+    const reports = await this.store.list('reports', { mission_id: missionId });
+    return reports.filter((r) => r.role === 'backend' && r.verdict === 'accepted').at(-1) ?? null;
+  }
+
   async #recordCost(mission, task, result) {
     const usd = Number(result?.total_cost_usd) || 0;
     await this.store.insert('costs', {
@@ -263,16 +270,32 @@ export class Cto {
     try {
       let mission = await this.#mission(task.mission_id);
       if (mission.status === 'approved') mission = await this.#setMission(mission, 'running');
+      let baseRef = 'HEAD';
+      let implementation = null;
+      if (role.reviewer) {
+        const impl = await this.#latestBackend(mission.id);
+        if (!impl?.evidence?.commit) throw new Error('No verified implementation to review');
+        baseRef = impl.evidence.commit;
+        implementation = [
+          `Commit ${impl.evidence.commit} on branch ${impl.evidence.branch}`,
+          `Files changed by the branch:\n${(impl.evidence.branch_files ?? impl.evidence.changed_files).map((f) => `- ${f}`).join('\n')}`,
+          impl.evidence.branch_diffstat ?? impl.evidence.diffstat ?? ''
+        ].join('\n\n');
+      }
       const ws = await ensureWorkspace({
-        repoPath: this.repoPath, baseDir: this.workspacesDir, task, mission, detached: role.readOnly
+        repoPath: this.repoPath, baseDir: this.workspacesDir, task, mission, baseRef, detached: role.readOnly
       });
-      const plan = task.role === 'backend' ? await this.#approvedPlan(mission.id) : null;
+      if (!task.base_commit && ws.base) {
+        await this.store.update('tasks', task.id, { base_commit: ws.base });
+        task.base_commit = ws.base;
+      }
+      const plan = task.role !== 'architect' ? await this.#approvedPlan(mission.id) : null;
       await emit(this.store, {
         mission_id: mission.id, task_id: task.id, type: 'task_started', actor: this.workerId,
         detail: { role: task.role, attempt: task.attempts, correction: task.corrections, workspace: path.basename(ws.path) }
       });
       const result = await this.runner({
-        instruction: buildInstruction(task.role, task, mission, { plan, feedback: task.feedback }),
+        instruction: buildInstruction(task.role, task, mission, { plan, feedback: task.feedback, implementation }),
         cwd: ws.path,
         tools: role.tools,
         permissionMode: role.permissionMode,
@@ -303,9 +326,9 @@ export class Cto {
 
   async #verify(task, mission, ws, result) {
     const text = typeof result?.result === 'string' ? result.result : '';
-    return task.role === 'architect'
-      ? this.#verifyArchitect(ws, text)
-      : this.#verifyBackend(task, mission, ws, text);
+    if (task.role === 'architect') return this.#verifyArchitect(ws, text);
+    if (ROLES[task.role].reviewer) return this.#verifyReviewer(ws, text);
+    return this.#verifyBackend(task, mission, ws, text);
   }
 
   async #verifyArchitect(ws, text) {
@@ -323,6 +346,24 @@ export class Cto {
       evidence: { plan_chars: text.length, changed_files: ev.changed_files },
       tests: { passed: 0, failed: 0 },
       artifact_text: redact(text)
+    };
+  }
+
+  /** A reviewer must stay read-only and end with a well-formed verdict. Its verdict can only add blockers. */
+  async #verifyReviewer(ws, text) {
+    const problems = [];
+    const parsed = validateReview(text);
+    if (!parsed.ok) problems.push(`Malformed review: ${parsed.error}`);
+    const ev = await collectEvidence(ws);
+    if (ev.changed_files.length) {
+      problems.push(`Reviewers are read-only but modified: ${ev.changed_files.join(', ')}`);
+      await resetWorkspace(ws);
+    }
+    return {
+      ok: problems.length === 0,
+      problems,
+      evidence: { review: parsed.ok ? parsed.review : null, changed_files: ev.changed_files, answer_chars: text.length },
+      tests: { passed: 0, failed: 0 }
     };
   }
 
@@ -353,8 +394,10 @@ export class Cto {
     }
 
     let commit = null;
+    let branch = { files: [], diffstat: '' };
     if (!problems.length) {
       commit = await commitAll(ws, `feat: ${mission.objective.slice(0, 60).replace(/\s+/g, ' ')} [cto ${task.id.slice(0, 8)}]`);
+      branch = await branchSummary(ws, task.base_commit);
     }
     return {
       ok: problems.length === 0,
@@ -362,6 +405,8 @@ export class Cto {
       evidence: {
         changed_files: ev.changed_files,
         diffstat: ev.diffstat,
+        branch_files: branch.files,
+        branch_diffstat: branch.diffstat,
         tests_command: 'node --test',
         acceptance: acceptance && { passed: acceptance.passed, failed: acceptance.failed },
         commit,
@@ -409,9 +454,14 @@ export class Cto {
       if (task.role === 'architect') {
         await this.#setMission(current, 'awaiting_owner');
         await emit(this.store, { mission_id: mission.id, type: 'approval_requested', detail: { kind: 'architecture' } });
+      } else if (task.role === 'backend') {
+        // Independent reviewers start in parallel on the verified commit.
+        const tasks = await this.store.list('tasks', { mission_id: mission.id });
+        for (const t of tasks.filter((x) => REVIEWER_ROLES.includes(x.role) && x.status === 'waiting')) {
+          await this.store.cas('tasks', t.id, { status: 'waiting' }, { status: 'queued' });
+        }
       } else {
-        await this.#setMission(current, 'review');
-        await emit(this.store, { mission_id: mission.id, type: 'approval_requested', detail: { kind: 'completion' } });
+        await this.#decideAfterReviews(mission.id);
       }
       return;
     }
@@ -428,6 +478,46 @@ export class Cto {
     });
   }
 
+  /**
+   * Runs once both independent reviewers are done. Blocking findings reopen the backend for rework
+   * (bounded by maxCorrections); otherwise the mission goes to the owner. Reviewers can only add blockers:
+   * a "pass" never replaces the CTO's own checks, which already ran.
+   */
+  async #decideAfterReviews(missionId) {
+    if (this.deciding.has(missionId)) return;
+    this.deciding.add(missionId);
+    try {
+      const tasks = await this.store.list('tasks', { mission_id: missionId });
+      const reviewers = tasks.filter((t) => REVIEWER_ROLES.includes(t.role));
+      if (!reviewers.length || !reviewers.every((t) => t.status === 'done')) return;
+      const backend = tasks.find((t) => t.role === 'backend');
+      const reports = await this.store.list('reports', { mission_id: missionId });
+      const latest = reviewers.map((t) => reports.filter((r) => r.task_id === t.id && r.verdict === 'accepted').at(-1));
+      const reviews = latest.filter(Boolean).map((r) => ({ role: r.role, ...r.evidence.review }));
+      const blocking = reviews.filter((r) => r.blocking);
+      const mission = await this.#mission(missionId);
+      if (mission.status !== 'running') return;
+
+      if (!blocking.length) {
+        await this.#setMission(mission, 'review');
+        await emit(this.store, { mission_id: missionId, type: 'approval_requested', detail: { kind: 'completion', reviews: reviews.map((r) => `${r.role}:${r.verdict}`) } });
+        return;
+      }
+      const feedback = blocking
+        .flatMap((r) => r.findings.filter((f) => f.severity !== 'low' || r.verdict === 'fail').map((f) => `[${r.role}/${f.severity}] ${f.file}: ${f.issue}`))
+        .join('\n') || blocking.map((r) => `[${r.role}] reviewer failed the implementation without detailed findings`).join('\n');
+      if (backend.corrections >= this.maxCorrections) {
+        await this.#block(missionId, `Independent review still blocking after ${this.maxCorrections} rework rounds: ${feedback.split('\n')[0]}`);
+        return;
+      }
+      await this.queue.reopenForRework(backend.id, `Independent review found blocking problems. Fix them, keep the tests green:\n${feedback}`);
+    } catch (error) {
+      await emit(this.store, { mission_id: missionId, type: 'decision_error', detail: { error: redact(error.message) } });
+    } finally {
+      this.deciding.delete(missionId);
+    }
+  }
+
   // --------------------------------------------------------------- reporting
 
   async consolidatedReport(missionId) {
@@ -441,6 +531,11 @@ export class Cto {
     if (mission.status === 'awaiting_owner') pending.push('architecture');
     if (mission.status === 'review') pending.push('completion');
     const corrections = events.filter((e) => e.type === 'correction_requested').length;
+    const reworks = events.filter((e) => e.type === 'rework_requested').length;
+    const reviews = ['qa', 'security'].flatMap((role) => {
+      const r = accepted.filter((x) => x.role === role).at(-1);
+      return r?.evidence?.review ? [{ role, verdict: r.evidence.review.verdict, findings: r.evidence.review.findings, blocking: r.evidence.review.blocking }] : [];
+    });
     const report = {
       mission: { id: mission.id, project: mission.project, objective: mission.objective, status: mission.status, budget_usd: mission.budget_usd, spent_usd: mission.spent_usd },
       tasks: mission.tasks.map((t) => ({ role: t.role, status: t.status, attempts: t.attempts, corrections: t.corrections, failures: t.failures })),
@@ -448,6 +543,8 @@ export class Cto {
       pending_approvals: pending,
       blockers: mission.blockers ?? [],
       corrections_requested: corrections,
+      rework_rounds: reworks,
+      reviews,
       branch: backend?.evidence?.branch ?? null,
       commit: backend?.evidence?.commit ?? null,
       tests: backend?.report?.tests ?? null
@@ -460,9 +557,10 @@ export class Cto {
     const ev = backend?.evidence;
     return [
       `## Objective\n${mission.objective}`,
-      `## Changes\n${ev ? `Branch \`${ev.branch}\` @ \`${ev.commit}\`\n\n${(ev.changed_files ?? []).map((f) => `- \`${f}\``).join('\n')}\n\n\`\`\`\n${ev.diffstat ?? ''}\n\`\`\`` : '_No verified implementation yet._'}`,
+      `## Changes\n${ev ? `Branch \`${ev.branch}\` @ \`${ev.commit}\`\n\n${(ev.branch_files ?? ev.changed_files ?? []).map((f) => `- \`${f}\``).join('\n')}\n\n\`\`\`\n${ev.branch_diffstat ?? ev.diffstat ?? ''}\n\`\`\`` : '_No verified implementation yet._'}`,
+      `## Independent reviews (advisory, can only add blockers)\n${report.reviews.length ? report.reviews.map((r) => `- ${r.role}: **${r.verdict}**, ${r.findings.length} finding(s)${r.findings.length ? `\n${r.findings.map((f) => `  - [${f.severity}] \`${f.file}\`: ${f.issue}`).join('\n')}` : ''}`).join('\n') : '_Not run yet._'}`,
       `## Tests actually executed by the CTO\n${backend ? `- project tests (\`${ev.tests_command}\`): ${backend.report.tests.passed} passed, ${backend.report.tests.failed} failed\n${ev.acceptance ? `- owner acceptance tests: ${ev.acceptance.passed} passed, ${ev.acceptance.failed} failed` : '- no owner acceptance tests were supplied'}` : '_None yet._'}`,
-      `## CTO control\n- correction rounds requested: ${report.corrections_requested}\n- approvals: ${report.approvals.map((a) => `${a.kind}=${a.decision}`).join(', ') || 'none yet'}\n- cost: ${report.mission.spent_usd} USD of ${report.mission.budget_usd} USD budget`,
+      `## CTO control\n- correction rounds requested: ${report.corrections_requested}, rework rounds after review: ${report.rework_rounds}\n- approvals: ${report.approvals.map((a) => `${a.kind}=${a.decision}`).join(', ') || 'none yet'}\n- cost: ${report.mission.spent_usd} USD of ${report.mission.budget_usd} USD budget`,
       '## Not done\nNo merge and no deployment: both require the owner\'s explicit approval.'
     ].join('\n\n');
   }

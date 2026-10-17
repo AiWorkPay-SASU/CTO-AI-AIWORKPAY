@@ -2,16 +2,16 @@
 
 Autonomous software-development team supervised by an AI CTO. **Independent from the AiWorkPay business workforce.**
 
-The owner gives an objective. The CTO plans it, delegates to specialist agents (real Claude Code sessions in isolated git
+The owner gives an objective. The CTO plans it, delegates to four specialists (architect, backend, then QA and security in parallel; real Claude Code sessions in isolated git
 worktrees), verifies their output itself (git evidence, tests re-run by the CTO, owner acceptance tests, secret scan),
-requests corrections, escalates blockers, and prepares a documented branch/PR for the owner. It never merges or deploys.
+requests corrections or rework, escalates blockers, and prepares a documented branch/PR for the owner. It never merges or deploys.
 
 ## Quick start
 No runtime dependency (Node ≥ 20, the `claude` CLI for real agent runs).
 
 ```
 npm run check                 # lint + secret scan + tests
-node scripts/demo.js          # real end-to-end demo with the actual Claude CLI (spends real money, capped at 2 USD)
+node scripts/demo.js          # real end-to-end demo with the actual Claude CLI (spends real money, about 0.30 USD, capped at 3 USD)
 CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + MissionControl on http://127.0.0.1:3000
 ```
 
@@ -34,9 +34,9 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 ## Verification status (what was really run, what was not)
 | Item | Status |
 |---|---|
-| `npm run lint`, `npm run scan`, `npm test` (80 tests) | **Run locally, green** (Node 22.22). GitHub Actions (`Tests` workflow) also passed on commit `8383bae`. |
-| Real Claude invocation on an isolated test repo, objective → delegation → execution → report → CTO control → verified commit | **Run, succeeded** — evidence in [docs/DEMO_EVIDENCE.md](docs/DEMO_EVIDENCE.md) |
-| Correction loop | Covered by tests with scripted agent doubles that modify real worktrees. **Not triggered in the live run** (the agent passed first time). |
+| `npm run lint`, `npm run scan`, `npm test` (93 tests) | **Run locally, green** (Node 22.22). GitHub Actions (`Tests` workflow) passed on the previous commits; the result for the latest push is shown in the PR checks. |
+| Real Claude invocation on an isolated test repo with all four agents: objective → delegation → execution → report → CTO control → verified commit → parallel QA + security review | **Run, succeeded** — evidence in [docs/DEMO_EVIDENCE.md](docs/DEMO_EVIDENCE.md) |
+| Correction loop and review-triggered rework | Covered by tests with scripted agent doubles that modify real worktrees. **Not triggered in the live run** (every agent passed first time). |
 | Restart recovery, cancellation, retries, budget stop, approval gates, concurrency limit | Covered by tests (real git worktrees, real files; agents scripted) |
 | `SupabaseStore` | Tested only against a **simulated PostgREST** server (`testkit/fake-postgrest.js`). **Never run against a real Supabase project.** |
 | `supabase/migrations/001_init.sql` | Written, **not applied** to any project. The only project reachable from this session (`zeeroo`) is unrelated and was not touched. A dedicated dev project is needed (creating one has a cost: owner decision). |
@@ -46,7 +46,8 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 ## Limitations
 - Authentication is two static bearer tokens (owner / viewer), not per-user accounts. Do not expose publicly; bind to localhost or put it behind an authenticating reverse proxy with TLS.
 - `FileStore` is single-process. The concurrency limit check is not atomic across several worker processes (use one worker or add a DB-side lock before scaling out).
-- Only two specialists exist (architect, backend). Frontend, QA, security and DevOps agents are not implemented.
+- Four specialists exist (architect, backend, QA, security). Frontend and DevOps agents are not implemented.
+- QA and security verdicts come from an LLM reading code that another LLM wrote: they are advisory and can be manipulated. By design they can only add blockers; they never replace the CTO's own checks (git evidence, tests re-run, acceptance tests, secret scan).
 - The CTO prepares the branch and PR body locally; opening the GitHub PR and merging are left to the owner.
 - `docs/01…06` are still empty templates, not approved specifications: they were not invented.
 - CI has no dependency audit or SAST step (there are no dependencies); actions are pinned by major tag, not by SHA.

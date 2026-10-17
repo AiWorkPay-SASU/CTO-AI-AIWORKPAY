@@ -55,7 +55,7 @@ const cto = new Cto({
 });
 
 const OWNER = 'demo-script (disposable test repo)';
-const mission = await cto.createMission({ objective: OBJECTIVE, project: 'demo/test-repo', budgetUsd: 2, acceptance: ACCEPTANCE });
+const mission = await cto.createMission({ objective: OBJECTIVE, project: 'demo/test-repo', budgetUsd: 3, acceptance: ACCEPTANCE });
 log(`mission ${mission.id.slice(0, 8)} created (${mission.status}), budget ${mission.budget_usd} USD`);
 
 await cto.approve(mission.id, { kind: 'mission', decision: 'approve', by: OWNER, note: 'demo run' });
@@ -70,10 +70,10 @@ if (current.status !== 'awaiting_owner') {
   log('architect did not produce an accepted plan; stopping for owner arbitration');
 } else {
   await cto.approve(mission.id, { kind: 'architecture', decision: 'approve', by: OWNER, note: 'plan reviewed by demo script' });
-  log('architecture approved -> dispatching the BACKEND (real Claude, write access limited to its worktree)');
+  log('architecture approved -> dispatching the BACKEND (real Claude, write access limited to its worktree), then QA + SECURITY reviews in parallel');
   await cto.drain();
   current = await cto.getMission(mission.id);
-  log(`status after backend: ${current.status}`);
+  log(`status after backend and independent reviews: ${current.status}`);
 }
 
 const report = await cto.consolidatedReport(mission.id);
@@ -84,6 +84,8 @@ const evidence = {
   tasks: report.tasks,
   approvals: report.approvals,
   corrections_requested: report.corrections_requested,
+  rework_rounds: report.rework_rounds,
+  reviews: report.reviews,
   blockers: report.blockers,
   branch: report.branch,
   commit: report.commit,
@@ -116,6 +118,6 @@ if (report.commit) {
 }
 const out = path.join(process.env.DEMO_OUT || root, 'demo-evidence.json');
 fs.writeFileSync(out, JSON.stringify(evidence, null, 2));
-log(`final mission status: ${evidence.mission.status} · spent ${evidence.mission.spent_usd} USD · corrections requested: ${evidence.corrections_requested}`);
+log(`final mission status: ${evidence.mission.status} · spent ${evidence.mission.spent_usd} USD · corrections: ${evidence.corrections_requested} · rework rounds: ${evidence.rework_rounds}`);
 log(`evidence written to ${out}`);
-console.log(JSON.stringify({ status: evidence.mission.status, spent_usd: evidence.mission.spent_usd, corrections: evidence.corrections_requested, commit: evidence.commit, recheck: evidence.independent_recheck, main_unchanged: evidence.main_unchanged }, null, 2));
+console.log(JSON.stringify({ status: evidence.mission.status, spent_usd: evidence.mission.spent_usd, corrections: evidence.corrections_requested, rework_rounds: evidence.rework_rounds, reviews: evidence.reviews.map((r) => ({ role: r.role, verdict: r.verdict, findings: r.findings.length })), commit: evidence.commit, recheck: evidence.independent_recheck, main_unchanged: evidence.main_unchanged }, null, 2));

@@ -33,14 +33,31 @@ export function forbiddenChanges(files) {
 export async function ensureWorkspace({ repoPath, baseDir, task, mission, baseRef = 'HEAD', detached = false }) {
   const dir = path.resolve(baseDir, task.id.slice(0, 8));
   const branch = `cto/${mission.id.slice(0, 8)}/${task.role}-${task.id.slice(0, 8)}`;
-  if (fs.existsSync(path.join(dir, '.git'))) return { path: dir, branch, reused: true };
+  if (fs.existsSync(path.join(dir, '.git'))) {
+    if (detached) {
+      // A reviewer's worktree must always sit on the commit under review (it changes after a rework).
+      await git(dir, ['checkout', '-q', '--detach', baseRef]);
+      await git(dir, ['reset', '--hard', '-q', baseRef]);
+      await git(dir, ['clean', '-fdq']);
+    }
+    return { path: dir, branch: detached ? null : branch, reused: true };
+  }
   fs.mkdirSync(baseDir, { recursive: true });
   const args = detached
     ? ['worktree', 'add', '--detach', dir, baseRef]
     : ['worktree', 'add', '-b', branch, dir, baseRef];
   const res = await git(repoPath, args);
   if (res.code !== 0) throw new Error(`worktree creation failed: ${redact(res.stderr).slice(0, 500)}`);
-  return { path: dir, branch: detached ? null : branch, reused: false };
+  const base = (await git(dir, ['rev-parse', 'HEAD'])).stdout.trim();
+  return { path: dir, branch: detached ? null : branch, reused: false, base };
+}
+
+/** Everything the branch changed since the worktree was created (spans correction and rework rounds). */
+export async function branchSummary(ws, baseCommit) {
+  if (!baseCommit) return { files: [], diffstat: '' };
+  const names = await git(ws.path, ['diff', '--name-only', `${baseCommit}..HEAD`]);
+  const stat = await git(ws.path, ['diff', '--stat', `${baseCommit}..HEAD`]);
+  return { files: names.stdout.split('\n').filter(Boolean), diffstat: redact(stat.stdout).trim() };
 }
 
 export async function removeWorkspace(repoPath, ws) {

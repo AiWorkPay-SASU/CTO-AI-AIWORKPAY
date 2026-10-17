@@ -143,7 +143,7 @@ test('end to end over HTTP: create, approve, run, validate, report', async (t) =
   assert.ok(report.json.commit);
 
   const agents = await call('/api/agents');
-  assert.deepEqual(agents.json.map((a) => a.role), ['architect', 'backend']);
+  assert.deepEqual(agents.json.map((a) => a.role), ['architect', 'backend', 'qa', 'security']);
 
   const final = await call(`/api/missions/${id}/approvals`, { method: 'POST', body: { kind: 'completion', decision: 'approve' } });
   assert.equal(final.json.status, 'completed');

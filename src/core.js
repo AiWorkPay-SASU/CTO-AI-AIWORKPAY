@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { sanitizeText } from './util.js';
 
-export const DEFAULT_BUDGET_USD = 2;
+export const DEFAULT_BUDGET_USD = 3;
 export const MAX_OBJECTIVE_LENGTH = 2000;
 
 export const MISSION_TRANSITIONS = Object.freeze({
@@ -21,7 +21,9 @@ export const TASK_TRANSITIONS = Object.freeze({
   queued: ['running', 'cancelled', 'failed'],
   running: ['review', 'queued', 'failed', 'cancelled'],
   review: ['done', 'queued', 'failed'],
-  done: [],
+  // done -> queued reopens a task for rework after a failed independent review;
+  // done -> waiting resets the reviewers that depend on it.
+  done: ['queued', 'waiting'],
   failed: [],
   cancelled: []
 });
@@ -55,8 +57,29 @@ export const ROLES = Object.freeze({
     tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash(node --test:*)', 'Bash(node --check:*)', 'Bash(ls:*)'],
     maxBudgetUsd: 1,
     timeoutMs: 300000
+  }),
+  // Independent reviewers: read-only, work on the backend's verified commit, can only make the CTO stricter.
+  qa: Object.freeze({
+    capabilities: ['review', 'test'],
+    readOnly: true,
+    reviewer: true,
+    permissionMode: 'default',
+    tools: ['Read', 'Glob', 'Grep', 'Bash(node --test:*)', 'Bash(ls:*)'],
+    maxBudgetUsd: 0.4,
+    timeoutMs: 240000
+  }),
+  security: Object.freeze({
+    capabilities: ['audit'],
+    readOnly: true,
+    reviewer: true,
+    permissionMode: 'default',
+    tools: ['Read', 'Glob', 'Grep'],
+    maxBudgetUsd: 0.4,
+    timeoutMs: 240000
   })
 });
+
+export const REVIEWER_ROLES = Object.freeze(Object.keys(ROLES).filter((r) => ROLES[r].reviewer));
 
 // GitHub-style owner/repo: the owner cannot start with a dot or hyphen, the repo cannot be "." or "..".
 const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9-]*\/(?!\.{1,2}$)[A-Za-z0-9_.-]+$/;
@@ -79,6 +102,18 @@ export function planMission(objective, project, { budgetUsd = DEFAULT_BUDGET_USD
   const id = randomUUID();
   const architectId = randomUUID();
   const backendId = randomUUID();
+  const reviewTask = (role, instruction) => ({
+    id: randomUUID(),
+    mission_id: id,
+    role,
+    instruction,
+    status: 'waiting',
+    depends_on: backendId,
+    requires_approval: null,
+    attempts: 0,
+    failures: 0,
+    corrections: 0
+  });
   const created = new Date().toISOString();
   return {
     id,
@@ -113,7 +148,9 @@ export function planMission(objective, project, { budgetUsd = DEFAULT_BUDGET_USD
         attempts: 0,
         failures: 0,
         corrections: 0
-      }
+      },
+      reviewTask('qa', `Independently validate the implementation of: ${cleanObjective}`),
+      reviewTask('security', `Audit the security of the implementation of: ${cleanObjective}`)
     ]
   };
 }

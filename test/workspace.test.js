@@ -5,7 +5,7 @@ import path from 'node:path';
 import { planMission } from '../src/core.js';
 import {
   ensureWorkspace, collectEvidence, forbiddenChanges, commitAll, writeAcceptance, clearAcceptance,
-  runTests, resetWorkspace, removeWorkspace
+  runTests, resetWorkspace, removeWorkspace, branchSummary
 } from '../src/workspace.js';
 import { makeRepo, tmpDir, write, head, branches, SLUG_TEST, GOOD_SLUG, BUGGY_SLUG } from '../testkit/fixtures.js';
 
@@ -104,4 +104,34 @@ test('commitAll commits on the task branch only, resetWorkspace discards changes
   await removeWorkspace(repo, ws);
   assert.ok(!fs.existsSync(ws.path));
   assert.ok(branches(repo).includes(ws.branch), 'branch is kept for the PR');
+});
+
+test('a reused reviewer worktree is moved onto the commit under review (it changes after a rework)', async () => {
+  const { repo, ws: implWs } = await workspace();
+  write(implWs.path, 'src/slug.js', GOOD_SLUG);
+  const first = await commitAll(implWs, 'round 1');
+  const { tasks, ...mission } = planMission('Build slug', 'owner/repo');
+  const base = tmpDir('cto-ws-');
+  const reviewer = await ensureWorkspace({ repoPath: repo, baseDir: base, task: tasks[2], mission, baseRef: first, detached: true });
+  assert.equal(head(reviewer.path), first);
+
+  write(implWs.path, 'src/extra.js', 'export const extra = 1;\n');
+  const second = await commitAll(implWs, 'round 2');
+  const again = await ensureWorkspace({ repoPath: repo, baseDir: base, task: tasks[2], mission, baseRef: second, detached: true });
+  assert.equal(again.reused, true);
+  assert.equal(head(again.path), second);
+  assert.ok(fs.existsSync(path.join(again.path, 'src/extra.js')));
+});
+
+test('branchSummary spans every round since the worktree was created', async () => {
+  const { ws } = await workspace();
+  assert.ok(ws.base, 'a fresh worktree reports its base commit');
+  write(ws.path, 'src/a.js', 'export const a = 1;\n');
+  await commitAll(ws, 'round 1');
+  write(ws.path, 'src/b.js', 'export const b = 1;\n');
+  await commitAll(ws, 'round 2');
+  const summary = await branchSummary(ws, ws.base);
+  assert.deepEqual([...summary.files].sort(), ['src/a.js', 'src/b.js']);
+  assert.match(summary.diffstat, /2 files changed/);
+  assert.deepEqual(await branchSummary(ws, null), { files: [], diffstat: '' });
 });

@@ -4,11 +4,17 @@ import {
   planMission, validateTransition, validateTaskTransition, validateReport, summarize, ROLES
 } from '../src/core.js';
 
-test('plans two isolated specialist tasks', () => {
+test('plans four specialist tasks: architect, backend, then independent qa and security', () => {
   const m = planMission('Build API', 'owner/repo');
-  assert.equal(m.tasks.length, 2);
-  assert.deepEqual(m.tasks.map((x) => x.role), ['architect', 'backend']);
+  assert.equal(m.tasks.length, 4);
+  assert.deepEqual(m.tasks.map((x) => x.role), ['architect', 'backend', 'qa', 'security']);
   assert.equal(m.status, 'pending_approval');
+  const backend = m.tasks[1];
+  for (const reviewer of m.tasks.slice(2)) {
+    assert.equal(reviewer.depends_on, backend.id);
+    assert.equal(reviewer.status, 'waiting');
+    assert.equal(reviewer.requires_approval, null);
+  }
 });
 
 test('backend waits for the architect task and for the architecture approval', () => {
@@ -59,6 +65,19 @@ test('report contract', () => {
   assert.throws(() => validateReport({ ...ok, status: 'MAYBE' }), /status/);
   assert.throws(() => validateReport({ ...ok, tests: null }), /tests/);
   assert.throws(() => validateReport(null));
+});
+
+test('reviewers are read-only, have no write tool and run on a bounded budget', () => {
+  for (const role of ['qa', 'security']) {
+    assert.equal(ROLES[role].readOnly, true);
+    assert.equal(ROLES[role].reviewer, true);
+    assert.ok(!ROLES[role].tools.some((t) => /Write|Edit/.test(t)), role);
+    assert.ok(ROLES[role].maxBudgetUsd <= 0.5);
+  }
+  assert.ok(!ROLES.security.tools.some((t) => /Bash/.test(t)), 'the security auditor never executes anything');
+  assert.equal(validateTaskTransition('done', 'queued'), 'queued');
+  assert.equal(validateTaskTransition('done', 'waiting'), 'waiting');
+  assert.throws(() => validateTaskTransition('failed', 'queued'));
 });
 
 test('architect is read-only and has no write tool; backend can write but not use git or network', () => {

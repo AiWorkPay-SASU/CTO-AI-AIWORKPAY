@@ -131,3 +131,27 @@ test('correction sends a reviewed task back with feedback and counts it', async 
   assert.equal(back.corrections, 1);
   assert.equal(back.feedback, 'fix X');
 });
+
+test('reopenForRework reopens the done task, resets its reviewers and is idempotent', async () => {
+  const { store, queue, mission } = await setup();
+  const tasks = await store.list('tasks', { mission_id: mission.id });
+  const [architect, backend, qa, security] = tasks;
+  await store.update('missions', mission.id, { status: 'running' });
+  await store.update('tasks', architect.id, { status: 'done' });
+  await store.update('tasks', backend.id, { status: 'done' });
+  await store.update('tasks', qa.id, { status: 'done' });
+  await store.update('tasks', security.id, { status: 'done' });
+
+  const reopened = await queue.reopenForRework(backend.id, 'fix the injection');
+  assert.equal(reopened.status, 'queued');
+  assert.equal(reopened.corrections, 1);
+  assert.equal(reopened.feedback, 'fix the injection');
+  assert.equal((await store.get('tasks', qa.id)).status, 'waiting');
+  assert.equal((await store.get('tasks', security.id)).status, 'waiting');
+  assert.equal((await store.get('tasks', architect.id)).status, 'done', 'unrelated tasks are untouched');
+
+  assert.equal(await queue.reopenForRework(backend.id, 'again'), null, 'second call is a no-op');
+  assert.equal((await store.get('tasks', backend.id)).corrections, 1);
+  const events = (await store.list('events', { mission_id: mission.id })).filter((e) => e.type === 'rework_requested');
+  assert.equal(events.length, 1);
+});

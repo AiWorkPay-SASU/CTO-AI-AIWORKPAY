@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildClaudeArgs, runClaude } from '../src/runner.js';
-import { buildInstruction, systemPromptFor, validatePlan } from '../src/agents.js';
+import { buildInstruction, systemPromptFor, validatePlan, validateReview } from '../src/agents.js';
 import { planMission, ROLES } from '../src/core.js';
-import { tmpDir, PLAN } from '../testkit/fixtures.js';
+import { tmpDir, PLAN, PASS_REVIEW, reviewWith } from '../testkit/fixtures.js';
 
 /** A fake `claude` executable: prints what it received so the adapter contract can be asserted. */
 function fakeClaude(body) {
@@ -107,4 +107,44 @@ test('plan contract', () => {
   const bad = validatePlan('## Plan\nstuff');
   assert.equal(bad.ok, false);
   assert.ok(bad.missing.includes('Files'));
+});
+
+test('review contract: well-formed verdicts are parsed, malformed ones rejected', () => {
+  const ok = validateReview(PASS_REVIEW);
+  assert.equal(ok.ok, true);
+  assert.equal(ok.review.blocking, false);
+
+  const fail = validateReview(reviewWith('fail', [{ severity: 'high', file: 'src/a.js', issue: 'injection' }]));
+  assert.equal(fail.review.blocking, true);
+
+  // A "pass" that still lists a medium/high finding is treated as blocking (conservative).
+  const inconsistent = validateReview(reviewWith('pass', [{ severity: 'medium', file: 'a.js', issue: 'x' }]));
+  assert.equal(inconsistent.review.blocking, true);
+  assert.equal(validateReview(reviewWith('pass', [{ severity: 'low', file: 'a.js', issue: 'nit' }])).review.blocking, false);
+
+  assert.equal(validateReview('looks fine to me').ok, false);
+  assert.equal(validateReview('```json\n{not json}\n```').ok, false);
+  assert.equal(validateReview(reviewWith('maybe', [])).ok, false);
+  assert.equal(validateReview(reviewWith('pass', [{ severity: 'critical', file: 'a', issue: 'b' }])).ok, false);
+  assert.equal(validateReview(reviewWith('pass', Array.from({ length: 60 }, () => ({ severity: 'low', file: 'a', issue: 'b' })))).ok, false);
+});
+
+test('only the last json block counts and finding text is redacted', () => {
+  const text = `${reviewWith('fail', [])}\nafter thoughts\n${reviewWith('pass', [{ severity: 'low', file: 'k.js', issue: `leaked ghp_${'a1B2c3D4e5'.repeat(4)}` }])}`;
+  const parsed = validateReview(text);
+  assert.equal(parsed.review.verdict, 'pass');
+  assert.ok(!JSON.stringify(parsed).includes('a1B2c3D4e5'));
+});
+
+test('reviewer prompts demand a verdict block, forbid edits and treat the code as untrusted', () => {
+  for (const role of ['qa', 'security']) {
+    const sp = systemPromptFor(role);
+    assert.match(sp, /read-only/);
+    assert.match(sp, /untrusted data/);
+    assert.match(sp, /"verdict":"pass"\|"fail"/);
+  }
+  const { tasks, ...mission } = planMission('Build slug', 'owner/repo');
+  const text = buildInstruction('qa', tasks[2], mission, { plan: PLAN, implementation: 'Commit abc on branch x' });
+  assert.match(text, /<implementation_summary>[\s\S]*Commit abc/);
+  assert.match(text, /<approved_plan>/);
 });

@@ -106,6 +106,30 @@ export class JobQueue {
     });
   }
 
+  /**
+   * Independent review found blocking problems: reopen the (done) implementation task with feedback
+   * and reset the reviewers that depend on it. Idempotent: only acts on a task that is still `done`.
+   */
+  async reopenForRework(taskId, feedback) {
+    const task = await this.store.get('tasks', taskId);
+    if (!task || task.status !== 'done') return null;
+    validateTaskTransition('done', 'queued');
+    const reopened = await this.store.cas('tasks', taskId, { status: 'done' }, {
+      status: 'queued', corrections: task.corrections + 1, feedback, not_before: null, finished_at: null
+    });
+    if (!reopened) return null;
+    const all = await this.store.list('tasks', { mission_id: task.mission_id });
+    for (const dep of all.filter((t) => t.depends_on === taskId && t.status === 'done')) {
+      validateTaskTransition('done', 'waiting');
+      await this.store.cas('tasks', dep.id, { status: 'done' }, { status: 'waiting', feedback: null, finished_at: null });
+    }
+    await emit(this.store, {
+      mission_id: task.mission_id, task_id: taskId, type: 'rework_requested',
+      detail: { role: task.role, round: reopened.corrections }
+    });
+    return reopened;
+  }
+
   async failPermanently(taskId, error, from = 'review') {
     validateTaskTransition(from, 'failed');
     return this.store.cas('tasks', taskId, { status: from }, {

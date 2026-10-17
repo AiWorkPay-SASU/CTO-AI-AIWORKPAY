@@ -5,7 +5,8 @@ import path from 'node:path';
 import { Cto } from '../src/cto.js';
 import { FileStore } from '../src/store/index.js';
 import {
-  makeRepo, tmpDir, write, head, branches, scriptedRunner, PLAN, GOOD_SLUG, BUGGY_SLUG, SLUG_TEST, ACCEPTANCE
+  makeRepo, tmpDir, write, head, branches, scriptedRunner, PLAN, GOOD_SLUG, BUGGY_SLUG, SLUG_TEST, ACCEPTANCE,
+  PASS_REVIEW, reviewWith
 } from '../testkit/fixtures.js';
 
 const OBJECTIVE = 'Add a slugify(text) helper with tests';
@@ -103,7 +104,9 @@ test('full loop: objective -> delegation -> execution -> report -> CTO control -
   assert.deepEqual(report.approvals.map((a) => a.kind), ['mission', 'architecture', 'completion']);
   assert.match(report.pull_request_body, /Tests actually executed by the CTO/);
   assert.match(report.pull_request_body, /No merge and no deployment/);
-  assert.equal(report.mission.spent_usd, 0.03); // 3 scripted runs at 0.01
+  assert.equal(report.mission.spent_usd, 0.05); // architect + 2 backend rounds + qa + security, 0.01 each
+  assert.deepEqual(report.reviews.map((r) => `${r.role}:${r.verdict}`), ['qa:pass', 'security:pass']);
+  assert.match(report.pull_request_body, /Independent reviews/);
 });
 
 test('an agent claiming success without any change is rejected, then escalated after the correction limit', async () => {
@@ -121,6 +124,8 @@ test('an agent claiming success without any change is rejected, then escalated a
   assert.equal(after.tasks.find((t) => t.role === 'backend').status, 'failed');
   assert.match(after.blockers[0], /could not be verified/);
   assert.equal(runner.calls.filter((c) => c.role === 'backend').length, 2, 'initial attempt + one correction');
+  assert.ok(!runner.calls.some((c) => c.role === 'qa' || c.role === 'security'), 'reviewers never see unverified work');
+  assert.deepEqual(after.tasks.filter((t) => ['qa', 'security'].includes(t.role)).map((t) => t.status), ['waiting', 'waiting']);
   assert.ok((await types(store, m.id)).includes('escalation'));
   assert.equal((await cto.consolidatedReport(m.id)).blockers.length, 1);
 });
@@ -317,4 +322,139 @@ test('concurrent missions respect the concurrency limit', async () => {
   await cto.drain();
   assert.equal(peak, 2);
   for (const m of missions) assert.equal((await cto.getMission(m.id)).status, 'awaiting_owner');
+});
+
+// ------------------------------------------------------------ independent reviews
+
+async function reachReviews(cto, extra = {}) {
+  const m = await create(cto, extra);
+  await cto.approve(m.id, { kind: 'mission', decision: 'approve' });
+  await cto.drain();
+  await cto.approve(m.id, { kind: 'architecture', decision: 'approve' });
+  await cto.drain();
+  return m;
+}
+
+test('qa and security run in parallel, in their own worktrees, on the backend\'s verified commit', async () => {
+  let active = 0;
+  let peak = 0;
+  const heads = {};
+  const reviewer = (name) => async ({ cwd }) => {
+    active += 1; peak = Math.max(peak, active);
+    heads[name] = head(cwd);
+    await new Promise((r) => setTimeout(r, 80));
+    active -= 1;
+    return { result: PASS_REVIEW };
+  };
+  const runner = scriptedRunner({ architect: [architectOk], backend: [backendGood], qa: [reviewer('qa')], security: [reviewer('security')] });
+  const { cto } = setup(runner, { maxConcurrent: 2 });
+  const m = await reachReviews(cto);
+  const after = await cto.getMission(m.id);
+  const commit = after.reports.find((r) => r.role === 'backend' && r.verdict === 'accepted').evidence.commit;
+
+  assert.equal(after.status, 'review');
+  assert.equal(peak, 2, 'both reviewers ran at the same time');
+  assert.equal(heads.qa, commit);
+  assert.equal(heads.security, commit);
+  const cwds = new Set(runner.calls.map((c) => c.cwd));
+  assert.equal(cwds.size, 4, 'architect, backend, qa and security each have their own worktree');
+  const qaCall = runner.calls.find((c) => c.role === 'qa');
+  assert.match(qaCall.instruction, /<implementation_summary>[\s\S]*src\/slug\.js/);
+  assert.ok(!qaCall.tools.some((t) => /Write|Edit/.test(t)));
+});
+
+test('a blocking review sends the work back to the backend; reviewers then re-run on the new commit', async () => {
+  const seenHeads = [];
+  const blockingOnce = [
+    async ({ cwd }) => { seenHeads.push(head(cwd)); return { result: reviewWith('fail', [{ severity: 'high', file: 'src/slug.js', issue: 'no input length limit (DoS)' }]) }; },
+    async ({ cwd }) => { seenHeads.push(head(cwd)); return { result: PASS_REVIEW }; }
+  ];
+  const secondRound = async ({ cwd }) => {
+    write(cwd, 'src/slug.js', GOOD_SLUG.replace('String(text)', 'String(text).slice(0, 1000)'));
+    write(cwd, 'src/limits.js', 'export const MAX = 1000;\n');
+    return { result: 'added a length limit' };
+  };
+  const runner = scriptedRunner({ architect: [architectOk], backend: [backendGood, secondRound], qa: blockingOnce });
+  const { repo, cto, store } = setup(runner);
+  const m = await reachReviews(cto);
+  const after = await cto.getMission(m.id);
+
+  assert.equal(after.status, 'review');
+  const backendCalls = runner.calls.filter((c) => c.role === 'backend');
+  assert.equal(backendCalls.length, 2);
+  assert.match(backendCalls[1].instruction, /\[qa\/high\] src\/slug\.js: no input length limit/);
+  assert.equal(after.tasks.find((t) => t.role === 'backend').corrections, 1);
+  assert.equal(runner.calls.filter((c) => c.role === 'qa').length, 2, 'qa re-ran after the rework');
+  assert.equal(runner.calls.filter((c) => c.role === 'security').length, 2, 'security re-ran too');
+
+  const commits = after.reports.filter((r) => r.role === 'backend' && r.verdict === 'accepted').map((r) => r.evidence.commit);
+  assert.equal(commits.length, 2);
+  assert.equal(seenHeads[0], commits[0], 'first review looked at the first commit');
+  assert.equal(seenHeads[1], commits[1], 'second review looked at the reworked commit');
+  assert.ok((await types(store, m.id)).includes('rework_requested'));
+
+  const report = await cto.consolidatedReport(m.id);
+  assert.equal(report.rework_rounds, 1);
+  assert.equal(report.commit, commits[1]);
+  assert.deepEqual([...report.reviews.map((r) => r.verdict)], ['pass', 'pass']);
+  // The PR lists everything the branch changed across both rounds.
+  assert.match(report.pull_request_body, /src\/limits\.js/);
+  assert.match(report.pull_request_body, /src\/slug\.js/);
+  assert.equal(head(repo, report.branch), commits[1]);
+});
+
+test('a "pass" that still carries a medium finding blocks the mission from reaching the owner', async () => {
+  const mediumPass = async () => ({ result: reviewWith('pass', [{ severity: 'medium', file: 'src/slug.js', issue: 'weak validation' }]) });
+  const runner = scriptedRunner({ architect: [architectOk], backend: [backendGood], security: [mediumPass] });
+  const { cto } = setup(runner, { maxCorrections: 0 });
+  const m = await reachReviews(cto);
+  const after = await cto.getMission(m.id);
+  assert.equal(after.status, 'blocked');
+  assert.match(after.blockers[0], /Independent review still blocking/);
+});
+
+test('review keeps failing: rework is bounded, then the mission is escalated', async () => {
+  const alwaysFail = async () => ({ result: reviewWith('fail', [{ severity: 'high', file: 'src/slug.js', issue: 'still broken' }]) });
+  const tweak = async ({ cwd, call }) => { write(cwd, 'src/slug.js', `${GOOD_SLUG}// round ${call}\n`); return { result: 'tweaked' }; };
+  const runner = scriptedRunner({ architect: [architectOk], backend: [backendGood, tweak], qa: [alwaysFail] });
+  const { cto, store } = setup(runner, { maxCorrections: 1 });
+  const m = await reachReviews(cto);
+  const after = await cto.getMission(m.id);
+  assert.equal(after.status, 'blocked');
+  assert.equal(runner.calls.filter((c) => c.role === 'backend').length, 2, 'initial + exactly one rework');
+  assert.match(after.blockers[0], /1 rework rounds/);
+  assert.ok((await types(store, m.id)).includes('escalation'));
+});
+
+test('a reviewer that edits files or omits the verdict is corrected; its edits are discarded', async () => {
+  const meddling = async ({ cwd }) => { write(cwd, 'src/slug.js', '// sabotaged\n'); return { result: PASS_REVIEW }; };
+  const noVerdict = async () => ({ result: 'Looks fine to me.' });
+  const runner = scriptedRunner({
+    architect: [architectOk], backend: [backendGood], qa: [meddling, passStepLocal], security: [noVerdict, passStepLocal]
+  });
+  const { cto } = setup(runner);
+  const m = await reachReviews(cto);
+  const after = await cto.getMission(m.id);
+  assert.equal(after.status, 'review');
+  const reports = after.reports;
+  const qaReports = reports.filter((r) => r.role === 'qa');
+  const secReports = reports.filter((r) => r.role === 'security');
+  assert.deepEqual(qaReports.map((r) => r.verdict), ['rejected', 'accepted']);
+  assert.match(qaReports[0].problems[0], /read-only but modified/);
+  assert.deepEqual(secReports.map((r) => r.verdict), ['rejected', 'accepted']);
+  assert.match(secReports[0].problems[0], /Malformed review/);
+  const commit = reports.find((r) => r.role === 'backend' && r.verdict === 'accepted').evidence.commit;
+  assert.equal(fs.readFileSync(path.join(runner.calls.find((c) => c.role === 'qa').cwd, 'src/slug.js'), 'utf8'), GOOD_SLUG, 'sabotage was reset');
+  assert.ok(commit);
+});
+
+async function passStepLocal() { return { result: PASS_REVIEW }; }
+
+test('a reviewer verdict never replaces the CTO checks: failing work does not reach the reviewers', async () => {
+  const runner = scriptedRunner({ architect: [architectOk], backend: [backendBuggy], qa: [passStepLocal], security: [passStepLocal] });
+  const { cto } = setup(runner, { maxCorrections: 0 });
+  const m = await reachReviews(cto, { acceptance: ACCEPTANCE });
+  const after = await cto.getMission(m.id);
+  assert.equal(after.status, 'blocked');
+  assert.ok(!runner.calls.some((c) => c.role === 'qa' || c.role === 'security'));
 });

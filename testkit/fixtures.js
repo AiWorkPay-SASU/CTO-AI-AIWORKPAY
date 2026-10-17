@@ -72,15 +72,28 @@ export const write = (cwd, rel, content) => {
   fs.writeFileSync(path.join(cwd, rel), content);
 };
 
+const fence = '```';
+export const PASS_REVIEW = `Reviewed, nothing blocking.\n${fence}json\n{"verdict":"pass","findings":[]}\n${fence}`;
+export const reviewWith = (verdict, findings) =>
+  `Review summary.\n${fence}json\n${JSON.stringify({ verdict, findings })}\n${fence}`;
+export const passStep = async () => ({ result: PASS_REVIEW });
+
 /**
  * Test double for the Claude CLI: each role gets a list of scripted behaviours that really
  * modify the isolated worktree. It exists only in tests; the demo script uses the real CLI.
+ * Reviewers pass by default so tests that do not care about review stay short.
  */
-export function scriptedRunner({ architect = [], backend = [] }) {
+export function scriptedRunner({ architect = [], backend = [], qa = [passStep], security = [passStep] }) {
   const calls = [];
-  const queues = { architect: [...architect], backend: [...backend] };
+  const queues = { architect: [...architect], backend: [...backend], qa: [...qa], security: [...security] };
+  const roleOf = (prompt) => {
+    if (prompt.includes('ARCHITECT')) return 'architect';
+    if (prompt.includes('QA specialist')) return 'qa';
+    if (prompt.includes('SECURITY specialist')) return 'security';
+    return 'backend';
+  };
   const runner = async (opts) => {
-    const role = opts.systemPrompt.includes('ARCHITECT') ? 'architect' : 'backend';
+    const role = roleOf(opts.systemPrompt);
     calls.push({ role, cwd: opts.cwd, instruction: opts.instruction, tools: opts.tools, permissionMode: opts.permissionMode });
     const step = queues[role].length > 1 ? queues[role].shift() : queues[role][0];
     if (!step) throw new Error(`no scripted behaviour for ${role}`);

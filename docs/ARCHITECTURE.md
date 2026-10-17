@@ -2,8 +2,9 @@
 
 ## Flow
 Owner → HTTP API / MissionControl → **Cto** (planner, dispatcher, verifier) → **JobQueue** (durable leases) →
-isolated Claude Code specialists (one git worktree per task) → CTO verification (git evidence, tests re-run by the CTO,
-owner acceptance tests, secret scan) → owner approval → branch + PR body. Supabase (or the local file store) keeps
+isolated Claude Code specialists (one git worktree per task): architect → *owner approval* → backend → CTO verification
+(git evidence, tests re-run by the CTO, owner acceptance tests, secret scan) → **QA ∥ security** reviews on the verified commit →
+CTO decision (blocking finding = rework of the backend, bounded) → owner approval → branch + PR body. Supabase (or the local file store) keeps
 missions, tasks, reports, append-only events, approvals and the cost ledger.
 
 ## Modules
@@ -21,7 +22,8 @@ missions, tasks, reports, append-only events, approvals and the cost ledger.
 ## State model
 Mission: `pending_approval → approved → running → awaiting_owner → running → review → completed`;
 `blocked`, `failed`, `cancelled` are reachable where it makes sense (see `MISSION_TRANSITIONS`).
-Task: `waiting → queued → running → review → done` (`review → queued` = correction round).
+Task: `waiting → queued → running → review → done` (`review → queued` = correction round; `done → queued` = backend rework after a
+blocking review, which resets the reviewers to `waiting`).
 Owner approvals are explicit records (`mission`, `architecture`, `completion`); the queue refuses to dispatch the backend
 task without a recorded `architecture` approval and a `done` architect task, even if the task was queued by mistake.
 
@@ -32,6 +34,7 @@ task without a recorded `architecture` approval and a `done` architect task, eve
 - Prompts fence untrusted text (`<objective>`, `<approved_plan>`, `<review_feedback>`) and strip secrets; reports and events are redacted.
 - Forbidden paths (`.github/`, `.env*`, `SECURITY.md`, `AGENTS.md`) and secret-like diffs are rejected.
 - Budget is checked before every dispatch; exceeding it blocks the mission and escalates.
+- Reviewers (QA, security) are read-only, detached worktrees pinned to the commit under review; a reviewer that edits a file or omits the JSON verdict is corrected and its edits are discarded. A review can only add blockers: a "pass" never skips a CTO check, and unverified work never reaches the reviewers.
 
 ## Known limits (see README "Verification status")
 Static owner/viewer tokens (no per-user auth), `FileStore` is single-process, the concurrency check is not atomic across
