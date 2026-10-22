@@ -39,3 +39,8 @@ task without a recorded `architecture` approval and a `done` architect task, eve
 ## Known limits (see README "Verification status")
 Static owner/viewer tokens (no per-user auth), `FileStore` is single-process, the concurrency check is not atomic across
 several worker processes, Supabase migration not applied to any project, no TLS termination.
+
+
+## Audit hardening (2026-10-22)
+
+Tests now run only through the CTO in a mandatory bubblewrap sandbox with no provider credentials. Specialists have no Bash tool. The exact staged tree is checked both before and after tests and rescanned before commit. Per-call mission budget reservations use CAS; interrupted calls consume an explicit conservative estimate. See [hardening details](HARDENING_2026-10-22.md).

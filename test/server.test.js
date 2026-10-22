@@ -1,3 +1,4 @@
+import { trustedFixtureTests } from '../testkit/fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from '../src/server.js';
@@ -16,6 +17,7 @@ async function boot(options = {}) {
   };
   const runner = scriptedRunner({ architect: [async () => ({ result: PLAN })], backend: [backend] });
   const cto = new Cto({
+    testRunner: trustedFixtureTests,
     store: new FileStore(tmpDir('cto-data-')), runner, repoPath: makeRepo(), workspacesDir: tmpDir('cto-ws-'),
     limits: { backoffMs: 5 }
   });
@@ -164,3 +166,4 @@ test('server refuses to start with weak or duplicated tokens', () => {
   assert.throws(() => createServer({ cto: {}, adminToken: ADMIN, viewerToken: ADMIN }), /differ/);
   assert.throws(() => createServer({ cto: {}, adminToken: ADMIN, viewerToken: 'short' }), /24\+/);
 });
+

@@ -7,7 +7,7 @@ import { runClaude } from './runner.js';
 import { buildInstruction, systemPromptFor, validatePlan, validateReview } from './agents.js';
 import {
   ensureWorkspace, removeWorkspace, collectEvidence, forbiddenChanges, commitAll,
-  writeAcceptance, clearAcceptance, runTests, resetWorkspace, branchSummary
+  writeAcceptance, clearAcceptance, runTests, resetWorkspace, branchSummary, snapshotTree, inspectTree
 } from './workspace.js';
 import { redact, nowIso, sleep } from './util.js';
 
@@ -32,12 +32,13 @@ function validateAcceptance(acceptance) {
  */
 export class Cto {
   constructor({
-    store, runner = runClaude, repoPath, workspacesDir, workerId = 'cto-worker-1', limits = {}
+    store, runner = runClaude, testRunner = runTests, repoPath, workspacesDir, workerId = 'cto-worker-1', limits = {}
   }) {
     if (!store) throw new Error('store required');
     if (!repoPath) throw new Error('repoPath required');
     this.store = store;
     this.runner = runner;
+    this.testRunner = testRunner;
     this.repoPath = path.resolve(repoPath);
     this.workspacesDir = path.resolve(workspacesDir ?? path.join(this.repoPath, '..', '.cto-workspaces'));
     this.workerId = workerId;
@@ -82,7 +83,9 @@ export class Cto {
       this.store.list('approvals', { mission_id: id }),
       this.store.list('reports', { mission_id: id })
     ]);
-    return { ...mission, spent_usd: await this.spent(id), tasks, approvals, reports };
+    const costs = await this.store.list('costs', { mission_id: id });
+    const estimated = Math.round(costs.filter((c) => c.estimated).reduce((sum, c) => sum + c.usd, 0) * 1e6) / 1e6;
+    return { ...mission, spent_usd: await this.spent(id), estimated_usd: estimated, tasks, approvals, reports };
   }
 
   async listMissions() {
@@ -177,24 +180,64 @@ export class Cto {
 
   // --------------------------------------------------------------- execution
 
+  async #releaseReservation(missionId, token) {
+    for (;;) {
+      const mission = await this.#mission(missionId);
+      const reservations = { ...mission.budget_reservations };
+      if (!reservations[token]) return;
+      delete reservations[token];
+      if (await this.store.cas('missions', missionId, { rev: mission.rev }, { budget_reservations: reservations })) return;
+    }
+  }
+
   async #affordable(task) {
-    const mission = await this.#mission(task.mission_id);
     const cap = ROLES[task.role].maxBudgetUsd;
-    if ((await this.spent(mission.id)) + cap <= mission.budget_usd) return true;
-    await emit(this.store, {
-      mission_id: mission.id, task_id: task.id, type: 'budget_exceeded',
-      detail: { budget_usd: mission.budget_usd, spent_usd: await this.spent(mission.id), next_task_cap_usd: cap }
-    });
-    await this.#block(mission.id, 'Budget would be exceeded by the next task; owner arbitration required');
-    return false;
+    for (;;) {
+      const mission = await this.#mission(task.mission_id);
+      if (!['approved', 'running'].includes(mission.status)) return false;
+      const spent = mission.budget_accounted_usd ?? await this.spent(mission.id);
+      const reservations = { ...mission.budget_reservations };
+      const reserved = Object.values(reservations).reduce((sum, r) => sum + r.usd, 0);
+      if (Math.round((spent + reserved + cap) * 1e6) <= Math.round(mission.budget_usd * 1e6)) {
+        const token = randomUUID();
+        reservations[token] = { task_id: task.id, usd: cap, created_at: Date.now() };
+        const updated = await this.store.cas('missions', mission.id, { rev: mission.rev }, {
+          budget_reservations: reservations, budget_accounted_usd: spent
+        });
+        if (updated) return { reservation_id: token, reserved_usd: cap };
+        continue;
+      }
+      // An in-flight task can settle below its cap. Wait for it before escalating.
+      if (reserved > 0) return false;
+      await emit(this.store, {
+        mission_id: mission.id, task_id: task.id, type: 'budget_exceeded',
+        detail: { budget_usd: mission.budget_usd, spent_usd: spent, next_task_cap_usd: cap }
+      });
+      await this.#block(mission.id, 'Budget would be exceeded by the next task; owner arbitration required');
+      return false;
+    }
   }
 
   /** Launches every dispatchable task up to the concurrency limit. Returns how many were started. */
   async tick({ wait = false } = {}) {
-    await this.queue.recoverExpired();
+    const recovered = await this.queue.recoverExpired();
+    for (const { id } of recovered) {
+      const task = await this.store.get('tasks', id);
+      if (task.reservation_id) await this.#recordCost(await this.#mission(task.mission_id), task, null);
+    }
+    // A crash between reserving and claiming must neither refund unknown spend nor stall forever.
+    for (const mission of await this.store.list('missions')) {
+      for (const [token, reservation] of Object.entries(mission.budget_reservations ?? {})) {
+        if (Date.now() - reservation.created_at <= this.queue.leaseMs) continue;
+        const task = await this.store.get('tasks', reservation.task_id);
+        if (task?.status === 'running' && task.reservation_id === token) continue;
+        if (task) await this.#recordCost(mission, { ...task, reservation_id: token, reserved_usd: reservation.usd }, null);
+      }
+    }
     const launched = [];
     for (;;) {
-      const task = await this.queue.claimNext({ workerId: this.workerId, accept: (t) => this.#affordable(t) });
+      const task = await this.queue.claimNext({ workerId: this.workerId, accept: (t) => this.#affordable(t),
+        release: (t, r) => this.#releaseReservation(t.mission_id, r.reservation_id) });
       if (!task) break;
       const p = this.#execute(task).finally(() => this.inflight.delete(p));
       this.inflight.add(p);
@@ -253,16 +296,42 @@ export class Cto {
   }
 
   async #recordCost(mission, task, result) {
-    const usd = Number(result?.total_cost_usd) || 0;
-    await this.store.insert('costs', {
-      id: randomUUID(), mission_id: mission.id, task_id: task.id, role: task.role, usd,
-      usage: result?.usage ?? null, model: Object.keys(result?.modelUsage ?? {})[0] ?? null, at: nowIso()
-    });
-    return usd;
+    const actual = Number(result?.total_cost_usd);
+    const estimated = result == null || !Number.isFinite(actual) || actual < 0;
+    const usd = estimated ? (task.reserved_usd ?? ROLES[task.role].maxBudgetUsd) : actual;
+    const id = task.reservation_id ?? randomUUID();
+    let recorded = await this.store.get('costs', id);
+    if (!recorded) {
+      try {
+        recorded = await this.store.insert('costs', {
+          id, mission_id: mission.id, task_id: task.id, role: task.role, usd, estimated,
+          usage: result?.usage ?? null, model: Object.keys(result?.modelUsage ?? {})[0] ?? null, at: nowIso()
+        });
+      } catch (error) {
+        recorded = await this.store.get('costs', id);
+        if (!recorded) throw error;
+      }
+    }
+    for (;;) {
+      const current = await this.#mission(mission.id);
+      const reservations = { ...current.budget_reservations };
+      if (!reservations[id]) break;
+      delete reservations[id];
+      if (await this.store.cas('missions', mission.id, { rev: current.rev }, {
+        budget_reservations: reservations,
+        budget_accounted_usd: Math.round(((current.budget_accounted_usd ?? 0) + recorded.usd) * 1e6) / 1e6
+      })) break;
+    }
+    if (recorded.usd > (task.reserved_usd ?? ROLES[task.role].maxBudgetUsd)) {
+      await this.#block(mission.id, 'Provider reported a cost above the reserved task cap');
+    }
+    return recorded.usd;
   }
 
   async #execute(task) {
     const role = ROLES[task.role];
+    let costRecorded = false;
+    let runnerStarted = false;
     const controller = new AbortController();
     this.controllers.set(task.id, controller);
     const beat = setInterval(() => { this.queue.heartbeat(task.id, this.workerId).catch(() => {}); }, Math.max(200, this.queue.leaseMs / 3));
@@ -294,6 +363,7 @@ export class Cto {
         mission_id: mission.id, task_id: task.id, type: 'task_started', actor: this.workerId,
         detail: { role: task.role, attempt: task.attempts, correction: task.corrections, workspace: path.basename(ws.path) }
       });
+      runnerStarted = true;
       const result = await this.runner({
         instruction: buildInstruction(task.role, task, mission, { plan, feedback: task.feedback, implementation }),
         cwd: ws.path,
@@ -305,15 +375,27 @@ export class Cto {
         systemPrompt: systemPromptFor(task.role)
       });
       const cost = await this.#recordCost(mission, task, result);
+      costRecorded = true;
       if (!(await this.queue.toReview(task.id))) return; // cancelled while running
       const verdict = await this.#verify(task, mission, ws, result);
       await this.#conclude(task, mission, ws, result, verdict, cost);
     } catch (error) {
+      // Failed or interrupted CLI output cannot prove zero spend. Retain the full cap as an explicit estimate.
+      if (!costRecorded) {
+        if (runnerStarted) await this.#recordCost(await this.#mission(task.mission_id), task, null);
+        else await this.#releaseReservation(task.mission_id, task.reservation_id);
+      }
       if (error.cancelled || controller.signal.aborted) {
         await emit(this.store, { mission_id: task.mission_id, task_id: task.id, type: 'task_cancelled' });
         return;
       }
       const message = redact(error.message);
+      const currentTask = await this.store.get('tasks', task.id);
+      if (currentTask?.status === 'review') {
+        await this.queue.failPermanently(task.id, message);
+        await this.#block(task.mission_id, `Verification failed safely: ${message}`);
+        return;
+      }
       const outcome = await this.queue.retryOrFail(task.id, message);
       if (outcome === 'failed') await this.#block(task.mission_id, `Task ${task.role} failed after retries: ${message}`);
     } finally {
@@ -370,6 +452,7 @@ export class Cto {
   async #verifyBackend(task, mission, ws, text) {
     const problems = [];
     const ev = await collectEvidence(ws);
+    const beforeTests = await snapshotTree(ws);
     if (!ev.changed_files.length) problems.push('No file was changed: nothing to verify, the claim of completion is unsupported');
     const forbidden = forbiddenChanges(ev.changed_files);
     if (forbidden.length) problems.push(`Forbidden paths modified: ${forbidden.join(', ')}. Revert them.`);
@@ -378,25 +461,35 @@ export class Cto {
     let tests = { passed: 0, failed: 0 };
     let acceptance = null;
     if (ev.changed_files.length) {
-      const run = await runTests(ws);
+      const run = await this.testRunner(ws);
       tests = { passed: run.passed, failed: run.failed };
       if (run.exit_code !== 0 || run.failed > 0 || run.passed < 1) {
         problems.push(`Project tests did not pass (exit ${run.exit_code}, passed ${run.passed}, failed ${run.failed}):\n${run.tail}`);
       }
       if (mission.acceptance) {
         const files = writeAcceptance(ws, mission.acceptance);
-        acceptance = await runTests(ws, files);
-        clearAcceptance(ws);
+        try {
+          acceptance = await this.testRunner(ws, files);
+        } finally {
+          clearAcceptance(ws);
+        }
         if (acceptance.exit_code !== 0 || acceptance.failed > 0 || acceptance.passed < 1) {
           problems.push(`Owner acceptance tests failed (passed ${acceptance.passed}, failed ${acceptance.failed}):\n${acceptance.tail}`);
         }
       }
     }
 
+    const verifiedTree = await snapshotTree(ws);
+    const staged = await inspectTree(ws, verifiedTree, task.base_commit ?? 'HEAD');
+    if (beforeTests !== verifiedTree) problems.push('Workspace changed during test execution; results do not verify the final tree');
+    const finalForbidden = forbiddenChanges(staged.files);
+    if (finalForbidden.length) problems.push(`Forbidden paths in final staged tree: ${finalForbidden.join(', ')}`);
+    if (staged.secret) problems.push('A secret-like value was found in the final staged tree');
+    ev.changed_files = staged.files;
     let commit = null;
     let branch = { files: [], diffstat: '' };
     if (!problems.length) {
-      commit = await commitAll(ws, `feat: ${mission.objective.slice(0, 60).replace(/\s+/g, ' ')} [cto ${task.id.slice(0, 8)}]`);
+      commit = await commitAll(ws, `feat: ${mission.objective.slice(0, 60).replace(/\s+/g, ' ')} [cto ${task.id.slice(0, 8)}]`, verifiedTree);
       branch = await branchSummary(ws, task.base_commit);
     }
     return {
@@ -443,6 +536,7 @@ export class Cto {
       problems: verdict.problems.map((p) => redact(p).slice(0, 2000)),
       artifact_text: verdict.artifact_text ?? null,
       cost_usd: cost,
+      cost_estimated: (await this.store.get('costs', task.reservation_id))?.estimated ?? false,
       created_at: nowIso()
     });
 
@@ -537,7 +631,7 @@ export class Cto {
       return r?.evidence?.review ? [{ role, verdict: r.evidence.review.verdict, findings: r.evidence.review.findings, blocking: r.evidence.review.blocking }] : [];
     });
     const report = {
-      mission: { id: mission.id, project: mission.project, objective: mission.objective, status: mission.status, budget_usd: mission.budget_usd, spent_usd: mission.spent_usd },
+      mission: { id: mission.id, project: mission.project, objective: mission.objective, status: mission.status, budget_usd: mission.budget_usd, spent_usd: mission.spent_usd, estimated_usd: mission.estimated_usd },
       tasks: mission.tasks.map((t) => ({ role: t.role, status: t.status, attempts: t.attempts, corrections: t.corrections, failures: t.failures })),
       approvals: mission.approvals.map((a) => ({ kind: a.kind, decision: a.decision, by: a.by, at: a.at })),
       pending_approvals: pending,
@@ -560,8 +654,9 @@ export class Cto {
       `## Changes\n${ev ? `Branch \`${ev.branch}\` @ \`${ev.commit}\`\n\n${(ev.branch_files ?? ev.changed_files ?? []).map((f) => `- \`${f}\``).join('\n')}\n\n\`\`\`\n${ev.branch_diffstat ?? ev.diffstat ?? ''}\n\`\`\`` : '_No verified implementation yet._'}`,
       `## Independent reviews (advisory, can only add blockers)\n${report.reviews.length ? report.reviews.map((r) => `- ${r.role}: **${r.verdict}**, ${r.findings.length} finding(s)${r.findings.length ? `\n${r.findings.map((f) => `  - [${f.severity}] \`${f.file}\`: ${f.issue}`).join('\n')}` : ''}`).join('\n') : '_Not run yet._'}`,
       `## Tests actually executed by the CTO\n${backend ? `- project tests (\`${ev.tests_command}\`): ${backend.report.tests.passed} passed, ${backend.report.tests.failed} failed\n${ev.acceptance ? `- owner acceptance tests: ${ev.acceptance.passed} passed, ${ev.acceptance.failed} failed` : '- no owner acceptance tests were supplied'}` : '_None yet._'}`,
-      `## CTO control\n- correction rounds requested: ${report.corrections_requested}, rework rounds after review: ${report.rework_rounds}\n- approvals: ${report.approvals.map((a) => `${a.kind}=${a.decision}`).join(', ') || 'none yet'}\n- cost: ${report.mission.spent_usd} USD of ${report.mission.budget_usd} USD budget`,
+      `## CTO control\n- correction rounds requested: ${report.corrections_requested}, rework rounds after review: ${report.rework_rounds}\n- approvals: ${report.approvals.map((a) => `${a.kind}=${a.decision}`).join(', ') || 'none yet'}\n- cost: ${report.mission.spent_usd} USD of ${report.mission.budget_usd} USD budget (including ${report.mission.estimated_usd ?? 0} USD estimated after interrupted or missing cost output)`,
       '## Not done\nNo merge and no deployment: both require the owner\'s explicit approval.'
     ].join('\n\n');
   }
 }
+

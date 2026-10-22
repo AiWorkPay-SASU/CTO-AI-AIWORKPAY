@@ -46,15 +46,17 @@ export class JobQueue {
    * Leases the next dispatchable task, or returns null. `accept` is an optional async
    * predicate (budget checks) evaluated after the built-in gates.
    */
-  async claimNext({ workerId, now = Date.now(), accept = null }) {
+  async claimNext({ workerId, now = Date.now(), accept = null, release = null }) {
     if ((await this.runningCount()) >= this.maxConcurrent) return null;
     const queued = await this.store.list('tasks', { status: 'queued' });
     for (const task of queued) {
       if (!(await this.isDispatchable(task, new Date(now).toISOString()))) continue;
-      if (accept && !(await accept(task))) continue;
+      const reservation = accept ? await accept(task) : true;
+      if (!reservation) continue;
       validateTaskTransition('queued', 'running');
       const claimed = await this.store.cas('tasks', task.id, { status: 'queued' }, {
         status: 'running',
+        ...(typeof reservation === 'object' ? reservation : {}),
         worker_id: workerId,
         attempts: task.attempts + 1,
         lease_expires_at: now + this.leaseMs,
@@ -70,6 +72,7 @@ export class JobQueue {
         });
         return claimed;
       }
+      if (release && typeof reservation === 'object') await release(task, reservation);
     }
     return null;
   }
@@ -190,3 +193,4 @@ export class JobQueue {
     return wasRunning;
   }
 }
+

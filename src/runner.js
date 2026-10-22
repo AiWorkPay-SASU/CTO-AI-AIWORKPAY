@@ -3,7 +3,7 @@ import { buildAgentEnv, redact } from './util.js';
 
 /** Flags that must never be forwarded to the CLI, whatever a caller passes. */
 const DENIED_TOOLS = [
-  'WebFetch', 'WebSearch', 'Bash(git:*)', 'Bash(curl:*)', 'Bash(wget:*)', 'Bash(npm:*)',
+  'Bash', 'WebFetch', 'WebSearch', 'Bash(git:*)', 'Bash(curl:*)', 'Bash(wget:*)', 'Bash(npm:*)',
   'Bash(npx:*)', 'Bash(rm:*)', 'Bash(sudo:*)', 'Bash(ssh:*)', 'Bash(gh:*)'
 ];
 
@@ -96,3 +96,4 @@ export async function runClaude({
     child.stdin.end(instruction);
   });
 }
+

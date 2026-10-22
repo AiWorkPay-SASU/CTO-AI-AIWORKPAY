@@ -1,3 +1,4 @@
+import { trustedFixtureTests } from '../testkit/fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -27,6 +28,7 @@ function setup(runner, limits = {}) {
   const dataDir = tmpDir('cto-data-');
   const store = new FileStore(dataDir);
   const cto = new Cto({
+    testRunner: trustedFixtureTests,
     store, runner, repoPath: repo, workspacesDir: tmpDir('cto-ws-'),
     limits: { backoffMs: 5, leaseMs: 1000, maxCorrections: 2, ...limits }
   });
@@ -233,6 +235,7 @@ test('restart recovery: a task leased by a dead worker is picked up by a new CTO
   // New process: everything it knows comes from disk.
   const restartedStore = new FileStore(dataDir);
   const restarted = new Cto({
+    testRunner: trustedFixtureTests,
     store: restartedStore, runner, repoPath: repo, workspacesDir: tmpDir('cto-ws-'),
     limits: { backoffMs: 5, leaseMs: 1000 }
   });
@@ -458,3 +461,4 @@ test('a reviewer verdict never replaces the CTO checks: failing work does not re
   assert.equal(after.status, 'blocked');
   assert.ok(!runner.calls.some((c) => c.role === 'qa' || c.role === 'security'));
 });
+

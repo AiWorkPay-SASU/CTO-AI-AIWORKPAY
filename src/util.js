@@ -69,3 +69,9 @@ export function buildAgentEnv(env = process.env) {
   out.GIT_TERMINAL_PROMPT = '0';
   return out;
 }
+
+/** Tests receive no provider credentials, proxies, home directory or runtime preload flags. */
+export function buildTestEnv() {
+  return { PATH: '/usr/bin:/bin', HOME: '/tmp', TMPDIR: '/tmp', LANG: 'C.UTF-8' };
+}
+
