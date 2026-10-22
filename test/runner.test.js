@@ -148,3 +148,20 @@ test('reviewer prompts demand a verdict block, forbid edits and treat the code a
   assert.match(text, /<implementation_summary>[\s\S]*Commit abc/);
   assert.match(text, /<approved_plan>/);
 });
+
+
+test('runClaude rejects excessive stdout without buffering unlimited output', async () => {
+  const cmd = fakeClaude("process.stdout.write('x'.repeat(9 * 1024 * 1024));");
+  await assert.rejects(
+    () => runClaude({ instruction: 'i', cwd: tmpDir(), tools: ['Read'], command: cmd, timeoutMs: 10000 }),
+    /output exceeded the 8 MiB safety limit/
+  );
+});
+
+test('runClaude rejects excessive stderr without buffering unlimited output', async () => {
+  const cmd = fakeClaude("process.stderr.write('x'.repeat(128 * 1024));");
+  await assert.rejects(
+    () => runClaude({ instruction: 'i', cwd: tmpDir(), tools: ['Read'], command: cmd, timeoutMs: 10000 }),
+    /stderr exceeded the 64 KiB safety limit/
+  );
+});
