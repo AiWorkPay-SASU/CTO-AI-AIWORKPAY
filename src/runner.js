@@ -41,6 +41,10 @@ export async function runClaude({
     let out = '';
     let err = '';
     let settled = false;
+    const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+    const MAX_ERROR_BYTES = 64 * 1024;
+    let outputBytes = 0;
+    let errorBytes = 0;
     const finish = (fn, value) => {
       if (settled) return;
       settled = true;
@@ -59,8 +63,24 @@ export async function runClaude({
     if (signal?.aborted) return onAbort();
     signal?.addEventListener('abort', onAbort, { once: true });
 
-    child.stdout.on('data', (d) => { out += d; });
-    child.stderr.on('data', (d) => { err += d; });
+    child.stdout.on('data', (d) => {
+      outputBytes += d.length;
+      if (outputBytes > MAX_OUTPUT_BYTES) {
+        child.kill('SIGKILL');
+        finish(reject, new Error('Claude output exceeded the 8 MiB safety limit'));
+        return;
+      }
+      out += d;
+    });
+    child.stderr.on('data', (d) => {
+      errorBytes += d.length;
+      if (errorBytes > MAX_ERROR_BYTES) {
+        child.kill('SIGKILL');
+        finish(reject, new Error('Claude stderr exceeded the 64 KiB safety limit'));
+        return;
+      }
+      err += d;
+    });
     child.on('error', (e) => finish(reject, e));
     child.on('close', (code) => {
       if (code !== 0) return finish(reject, new Error(`Claude exit ${code}: ${redact(err || out).slice(0, 1000)}`));
