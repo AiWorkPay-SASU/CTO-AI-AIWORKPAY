@@ -94,7 +94,7 @@
       el('h3', {}, 'Rapports'),
       ...m.reports.map((r) => el('div', {},
         el('div', { class: 'row' }, el('strong', {}, r.role), badge(r.verdict),
-          el('span', { class: 'muted' }, `tests ${r.report.tests.passed} ok / ${r.report.tests.failed} ko · ${r.cost_usd.toFixed(4)} USD`)),
+          el('span', { class: 'muted' }, `tests ${r.report.tests.passed} ok / ${r.report.tests.failed} ko · ${r.cost_usd.toFixed(4)} USD${r.cost_estimated ? ' (estimate)' : ''}`)),
         r.problems.length ? el('pre', {}, r.problems.join('\n---\n')) : '')),
       el('h3', {}, 'Journal d’audit'),
       el('table', {}, ...events.map((e) => el('tr', {},
@@ -110,7 +110,7 @@
     box.addEventListener('toggle', () => { if (box.open) guarded(() => loadDetails(m, details)); });
     return el('article', { class: 'mission' },
       el('div', { class: 'row' }, badge(m.status), el('strong', {}, m.project),
-        el('span', { class: 'muted' }, `${m.spent_usd.toFixed(4)} / ${m.budget_usd} USD`)),
+        el('span', { class: 'muted' }, `${m.spent_usd.toFixed(4)} / ${m.budget_usd} USD${m.estimated_usd ? ` (including ${m.estimated_usd.toFixed(4)} estimated)` : ''}`)),
       el('p', {}, m.objective),
       m.blockers?.length ? el('div', { class: 'row' }, badge('blocked'), ...m.blockers.map((b) => el('span', {}, b))) : '',
       el('table', {}, el('tr', {}, ...['agent', 'état', 'tentatives', 'corrections', 'échecs'].map((h) => el('th', {}, h))),
@@ -162,3 +162,4 @@
     });
   });
 })();
+

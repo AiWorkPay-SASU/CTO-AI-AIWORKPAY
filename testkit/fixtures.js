@@ -2,6 +2,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { run } from '../src/workspace.js';
+import { buildTestEnv } from '../src/util.js';
+
+/** Only for the trusted, repository-owned fixtures below. Never used by the production API or real demo. */
+export async function trustedFixtureTests(ws, files = null) {
+  const result = await run(process.execPath, ['--test', '--test-reporter=tap', ...(files ?? [])], {
+    cwd: ws.path, env: buildTestEnv()
+  });
+  const count = (label) => Number(result.stdout.match(new RegExp(`^# ${label} (\\d+)`, 'm'))?.[1] ?? 0);
+  return { exit_code: result.code, passed: count('pass'), failed: count('fail'), tail: result.stdout.slice(-1500) };
+}
 
 export function tmpDir(prefix = 'cto-test-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -103,3 +114,4 @@ export function scriptedRunner({ architect = [], backend = [], qa = [passStep], 
   runner.calls = calls;
   return runner;
 }
+

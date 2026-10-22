@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { buildAgentEnv, redact, containsSecret } from './util.js';
+import { buildAgentEnv, buildTestEnv, redact, containsSecret } from './util.js';
+import { sandboxCommand } from './test-sandbox.js';
 
 const GIT_ENV = () => ({ ...buildAgentEnv(), GIT_CONFIG_NOSYSTEM: '1' });
 const GIT_BASE = ['-c', 'core.hooksPath=/dev/null', '-c', 'user.name=CTO-AI', '-c', 'user.email=cto-ai@localhost'];
@@ -94,11 +95,39 @@ export async function resetWorkspace(ws) {
   await git(ws.path, ['clean', '-fdq']);
 }
 
-export async function commitAll(ws, message) {
+export async function commitAll(ws, message, expectedTree = null) {
   await git(ws.path, ['add', '-A']);
+  if (expectedTree && (await snapshotTree(ws)) !== expectedTree) throw new Error('Workspace changed after verification');
   const res = await git(ws.path, ['commit', '-m', message]);
   if (res.code !== 0) throw new Error(`commit failed: ${redact(res.stderr).slice(0, 300)}`);
   return (await git(ws.path, ['rev-parse', 'HEAD'])).stdout.trim();
+}
+
+/** Stage a snapshot. The commit later uses this exact index, never an unchecked working tree. */
+export async function snapshotTree(ws) {
+  for (const args of [['add', '-A'], ['write-tree']]) {
+    const result = await git(ws.path, args);
+    if (result.code !== 0) throw new Error('Cannot snapshot workspace');
+    if (args[0] === 'write-tree') return result.stdout.trim();
+  }
+}
+
+export async function inspectTree(ws, tree, base = 'HEAD') {
+  const names = await git(ws.path, ['diff', '--name-only', '-z', base, tree]);
+  if (names.code !== 0) throw new Error('Cannot inspect staged files');
+  const files = names.stdout.split('\0').filter(Boolean);
+  let secret = false;
+  for (const file of files) {
+    const entry = await git(ws.path, ['ls-tree', tree, '--', file]);
+    if (!entry.stdout) continue; // deletion
+    if (entry.code !== 0) throw new Error('Cannot inspect staged entry');
+    const blob = entry.stdout.match(/^\d+ blob ([0-9a-f]+)\t/);
+    if (!blob) throw new Error('Unsupported staged entry');
+    const content = await git(ws.path, ['cat-file', 'blob', blob[1]]);
+    if (content.code !== 0) throw new Error('Cannot scan staged content (missing or too large)');
+    secret ||= containsSecret(content.stdout);
+  }
+  return { files, secret };
 }
 
 /** Writes owner-supplied acceptance tests under .cto-acceptance/ (never part of the commit). */
@@ -128,10 +157,12 @@ function parseTap(output) {
 /** The CTO runs the tests itself; an agent saying "tests pass" is never evidence. */
 export async function runTests(ws, files = null, { timeoutMs = 120000 } = {}) {
   const args = ['--test', '--test-reporter=tap', ...(files ?? [])];
-  const res = await run(process.execPath, args, { cwd: ws.path, timeoutMs, env: buildAgentEnv() });
+  const sandbox = sandboxCommand(ws.path, args);
+  const res = await run(sandbox.command, sandbox.args, { cwd: ws.path, timeoutMs, env: buildTestEnv() });
   const { passed, failed } = parseTap(res.stdout);
   return {
     command: `node ${args.join(' ')}`,
+    sandbox_required: true,
     exit_code: res.code,
     timed_out: res.timedOut,
     passed: Number.isNaN(passed) ? 0 : passed,
@@ -139,3 +170,4 @@ export async function runTests(ws, files = null, { timeoutMs = 120000 } = {}) {
     tail: redact(`${res.stdout}\n${res.stderr}`).slice(-1500)
   };
 }
+

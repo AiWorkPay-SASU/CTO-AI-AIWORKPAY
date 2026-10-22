@@ -1,3 +1,4 @@
+import { trustedFixtureTests } from '../testkit/fixtures.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -5,7 +6,7 @@ import path from 'node:path';
 import { planMission } from '../src/core.js';
 import {
   ensureWorkspace, collectEvidence, forbiddenChanges, commitAll, writeAcceptance, clearAcceptance,
-  runTests, resetWorkspace, removeWorkspace, branchSummary
+  resetWorkspace, removeWorkspace, branchSummary
 } from '../src/workspace.js';
 import { makeRepo, tmpDir, write, head, branches, SLUG_TEST, GOOD_SLUG, BUGGY_SLUG } from '../testkit/fixtures.js';
 
@@ -62,13 +63,13 @@ test('the CTO runs the tests itself and parses real results', async () => {
   const { ws } = await workspace();
   write(ws.path, 'src/slug.js', GOOD_SLUG);
   write(ws.path, 'test/slug.test.js', SLUG_TEST);
-  const ok = await runTests(ws);
+  const ok = await trustedFixtureTests(ws);
   assert.equal(ok.exit_code, 0);
   assert.equal(ok.passed, 1);
   assert.equal(ok.failed, 0);
 
   write(ws.path, 'src/slug.js', 'export const slugify = () => "nope";\n');
-  const ko = await runTests(ws);
+  const ko = await trustedFixtureTests(ws);
   assert.notEqual(ko.exit_code, 0);
   assert.equal(ko.failed, 1);
 });
@@ -80,7 +81,7 @@ test('acceptance tests are written outside the commit and validated by name', as
     'a.test.js': "import test from 'node:test';import assert from 'node:assert/strict';import {slugify} from '../src/slug.js';test('x',()=>assert.equal(slugify('A B'),'a-b'));"
   });
   assert.deepEqual(files, [path.join('.cto-acceptance', 'a.test.js')]);
-  const run = await runTests(ws, files);
+  const run = await trustedFixtureTests(ws, files);
   assert.equal(run.passed, 1);
   clearAcceptance(ws);
   assert.ok(!fs.existsSync(path.join(ws.path, '.cto-acceptance')));
@@ -135,3 +136,4 @@ test('branchSummary spans every round since the worktree was created', async () 
   assert.match(summary.diffstat, /2 files changed/);
   assert.deepEqual(await branchSummary(ws, null), { files: [], diffstat: '' });
 });
+

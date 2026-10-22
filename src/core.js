@@ -54,7 +54,7 @@ export const ROLES = Object.freeze({
     capabilities: ['implement', 'test'],
     readOnly: false,
     permissionMode: 'acceptEdits',
-    tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep', 'Bash(node --test:*)', 'Bash(node --check:*)', 'Bash(ls:*)'],
+    tools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
     maxBudgetUsd: 1,
     timeoutMs: 300000
   }),
@@ -64,7 +64,7 @@ export const ROLES = Object.freeze({
     readOnly: true,
     reviewer: true,
     permissionMode: 'default',
-    tools: ['Read', 'Glob', 'Grep', 'Bash(node --test:*)', 'Bash(ls:*)'],
+    tools: ['Read', 'Glob', 'Grep'],
     maxBudgetUsd: 0.4,
     timeoutMs: 240000
   }),
@@ -188,3 +188,4 @@ export function summarize(mission, reports) {
     blockers: reports.filter((r) => r.status === 'blocked').map((r) => r.summary)
   };
 }
+

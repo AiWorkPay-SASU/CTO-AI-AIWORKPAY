@@ -7,7 +7,7 @@ worktrees), verifies their output itself (git evidence, tests re-run by the CTO,
 requests corrections or rework, escalates blockers, and prepares a documented branch/PR for the owner. It never merges or deploys.
 
 ## Quick start
-No runtime dependency (Node ≥ 20, the `claude` CLI for real agent runs).
+No npm runtime dependency. The worker requires Linux, Node ≥ 20, bubblewrap (`bwrap`) with namespace support, and the `claude` CLI for real agent runs. Generated tests fail closed if isolation is unavailable.
 
 ```
 npm run check                 # lint + secret scan + tests
@@ -43,6 +43,10 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 | MissionControl UI | Served and CSP-tested over HTTP, lint-checked (no `innerHTML`, no browser storage). **Not exercised in a real browser.** |
 | `npm install` | Not needed (no dependencies). The previous `@supabase/supabase-js` dependency was removed because the session's network policy blocks the npm registry. |
 
+## Audit corrections
+
+[Hardening details and validation limits](docs/HARDENING_2026-10-22.md): final staged-tree checks after tests, persisted budget reservations, and mandatory credential-free Linux test isolation. Agents submit tests; the CTO executes them. Interrupted calls retain an explicitly labelled cost estimate. CI requires the real sandbox integration check.
+
 ## Limitations
 - Authentication is two static bearer tokens (owner / viewer), not per-user accounts. Do not expose publicly; bind to localhost or put it behind an authenticating reverse proxy with TLS.
 - `FileStore` is single-process. The concurrency limit check is not atomic across several worker processes (use one worker or add a DB-side lock before scaling out).
@@ -50,7 +54,8 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 - QA and security verdicts come from an LLM reading code that another LLM wrote: they are advisory and can be manipulated. By design they can only add blockers; they never replace the CTO's own checks (git evidence, tests re-run, acceptance tests, secret scan).
 - The CTO prepares the branch and PR body locally; opening the GitHub PR and merging are left to the owner.
 - `docs/01…06` are still empty templates, not approved specifications: they were not invented.
-- CI has no dependency audit or SAST step (there are no dependencies); actions are pinned by major tag, not by SHA.
+- CI has no dependency audit or SAST step (there are no npm dependencies); actions are pinned by major tag, not by SHA.
 
 ## Release checklist
 Owner reviews PR · dedicated Supabase dev project created and migration applied and tested (including RLS denial for `anon`) · per-user auth in front of the API · TLS · budget ceilings confirmed · only then consider hosting. No production deployment without explicit owner approval.
+
