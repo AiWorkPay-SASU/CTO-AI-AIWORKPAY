@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ROLES } from './core.js';
 import { Cto } from './cto.js';
 import { storeFromEnv } from './store/index.js';
+import { githubFromEnv } from './github.js';
 import { createHash } from 'node:crypto';
 import { safeEqual, redact } from './util.js';
 
@@ -168,6 +169,9 @@ export function createServer({
       return send(res, 200, await cto.approve(id, { kind: body.kind, decision: body.decision, note: body.note, by: role, credentialId: identity.credentialId }));
     }
     if (action === 'budget') return send(res, 200, await cto.raiseBudget(id, body.budget_usd, { by: role }));
+    if (action === 'resume') return send(res, 200, await cto.resumeMission(id, { by: role, note: body.note, credentialId: identity.credentialId }));
+    if (action === 'pr') return send(res, 200, await cto.submitPullRequest(id, { by: role, credentialId: identity.credentialId }));
+    if (action === 'ci') return send(res, 200, await cto.checkCi(id));
     if (action === 'cancel') return send(res, 200, await cto.cancelMission(id, { by: role, reason: body.reason ?? 'cancelled by owner' }));
     if (action === 'run') {
       if (!(await cto.store.get('missions', id))) throw new HttpError(404, 'Not found');
@@ -196,9 +200,12 @@ export function createServer({
 }
 
 export function ctoFromEnv(env = process.env) {
+  // CTO_REPOS: JSON {"owner/repo": "/path/to/checkout"}; it is also the allowlist of projects.
+  const repos = env.CTO_REPOS ? JSON.parse(env.CTO_REPOS) : null;
   return new Cto({
     store: storeFromEnv(env),
-    repoPath: env.CTO_REPO_PATH || process.cwd(),
+    github: githubFromEnv(env),
+    ...(repos ? { repos } : { repoPath: env.CTO_REPO_PATH || process.cwd() }),
     workspacesDir: env.CTO_WORKSPACES_DIR,
     limits: { maxConcurrent: Number(env.CTO_MAX_CONCURRENT || 2) }
   });

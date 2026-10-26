@@ -239,3 +239,31 @@ test('D1: an agent whose lease was recovered is stopped and cannot overwrite the
   assert.equal(after.tasks.find((x) => x.role === 'architect').attempts, 2);
   assert.equal(after.reports.filter((r) => r.role === 'architect' && r.verdict === 'accepted').length, 1);
 });
+
+// ------------------------------------------------ D6 escalation can be resolved
+
+test('D6: after an escalation the owner can resume the mission; the failed task gets a fresh attempt budget', async (t) => {
+  const crash = async () => { throw new Error('agent crashed'); };
+  const { cto, store } = ctoSetup(t, { backend: [crash, crash, crash, backendGood] });
+  const m = await cto.createMission({ objective: 'Implement slugify', project: 'owner/repo', budgetUsd: 10 });
+  await cto.approve(m.id, { kind: 'mission', decision: 'approve' });
+  await cto.drain();
+  await cto.approve(m.id, { kind: 'architecture', decision: 'approve' });
+  await cto.drain();
+  let state = await cto.getMission(m.id);
+  assert.equal(state.status, 'blocked');
+  assert.equal(state.tasks.find((x) => x.role === 'backend').status, 'failed');
+
+  // Raising the budget alone used to leave the failed task stranded forever.
+  await assert.rejects(() => cto.resumeMission(randomUUID(), {}), /not found/i);
+  await cto.resumeMission(m.id, { by: 'owner', credentialId: 'c0ffee00', note: 'retry after fixing the agent' });
+  await cto.drain();
+  state = await cto.getMission(m.id);
+  assert.equal(state.status, 'review', 'the retried backend passed verification and both reviewers ran');
+  assert.deepEqual(state.blockers, []);
+  const resumed = (await store.list('events', { mission_id: m.id })).find((e) => e.type === 'mission_resumed');
+  assert.equal(resumed.actor, 'owner');
+  assert.equal(resumed.detail.credential_id, 'c0ffee00');
+  assert.equal(resumed.detail.requeued.length, 1);
+  await assert.rejects(() => cto.resumeMission(m.id, {}), /only a blocked mission/i);
+});

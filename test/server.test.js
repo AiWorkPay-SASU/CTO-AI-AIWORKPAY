@@ -167,3 +167,26 @@ test('server refuses to start with weak or duplicated tokens', () => {
   assert.throws(() => createServer({ cto: {}, adminToken: ADMIN, viewerToken: 'short' }), /24\+/);
 });
 
+
+test('resume is owner-only, audited with the credential fingerprint, and approvals record it too', async (t) => {
+  const { call, cto, close } = await boot();
+  t.after(close);
+  const { createHash } = await import('node:crypto');
+  const fingerprint = createHash('sha256').update(ADMIN).digest('hex').slice(0, 8);
+  const created = (await call('/api/missions', { method: 'POST', body: { objective: 'Add slugify helper', project: 'owner/repo' } })).json;
+  const approval = (await call(`/api/missions/${created.id}/approvals`, { method: 'POST', body: { kind: 'mission', decision: 'approve' } })).json;
+  assert.equal(approval.approvals[0].credential_id, fingerprint);
+  assert.ok(!JSON.stringify(approval).includes(ADMIN), 'the credential itself is never stored');
+
+  // An escalation as it would be left by the engine: blocked mission, failed task.
+  const [architect] = (await cto.store.list('tasks', { mission_id: created.id }));
+  await cto.store.update('tasks', architect.id, { status: 'failed', failures: 3, error: 'agent crashed' });
+  await cto.store.update('missions', created.id, { status: 'blocked', blockers: ['Task architect failed after retries'] });
+
+  assert.equal((await call(`/api/missions/${created.id}/resume`, { method: 'POST', body: {}, token: VIEWER })).status, 403);
+  const resumed = await call(`/api/missions/${created.id}/resume`, { method: 'POST', body: { note: 'retry' } });
+  assert.equal(resumed.status, 200);
+  assert.equal(resumed.json.status, 'running');
+  assert.equal(resumed.json.tasks.find((x) => x.role === 'architect').status, 'queued');
+  assert.equal((await call(`/api/missions/${created.id}/resume`, { method: 'POST', body: {} })).status, 400, 'not blocked any more');
+});

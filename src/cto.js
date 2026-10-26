@@ -41,14 +41,19 @@ function validateAcceptance(acceptance) {
  */
 export class Cto {
   constructor({
-    store, runner = runClaude, testRunner = runTests, repoPath, workspacesDir, workerId = 'cto-worker-1', limits = {}
+    store, runner = runClaude, testRunner = runTests, repoPath, repos = null, github = null, workspacesDir,
+    workerId = 'cto-worker-1', limits = {}
   }) {
     if (!store) throw new Error('store required');
-    if (!repoPath) throw new Error('repoPath required');
+    if (!repoPath && !repos) throw new Error('repoPath required');
     this.store = store;
     this.runner = runner;
     this.testRunner = testRunner;
-    this.repoPath = path.resolve(repoPath);
+    // `repos` maps "owner/repo" to a local checkout and doubles as the allowlist of projects the CTO may work on.
+    this.repos = repos ? new Map(Object.entries(repos).map(([project, dir]) => [project, path.resolve(dir)])) : null;
+    if (this.repos && !this.repos.size) throw new Error('repos must not be empty');
+    this.repoPath = path.resolve(repoPath ?? [...this.repos.values()][0]);
+    this.github = github;
     this.workspacesDir = path.resolve(workspacesDir ?? path.join(this.repoPath, '..', '.cto-workspaces'));
     this.workerId = workerId;
     this.maxCorrections = limits.maxCorrections ?? 2;
@@ -68,11 +73,19 @@ export class Cto {
 
   // ---------------------------------------------------------------- missions
 
+  #repoFor(project) {
+    if (!this.repos) return this.repoPath;
+    const dir = this.repos.get(project);
+    if (!dir) throw new Error('Project is not an authorized repository');
+    return dir;
+  }
+
   async createMission({ objective, project, budgetUsd, acceptance }) {
     const plan = planMission(objective, project, {
       ...(budgetUsd === undefined ? {} : { budgetUsd }),
       acceptance: validateAcceptance(acceptance)
     });
+    this.#repoFor(plan.project);
     const { tasks, ...mission } = plan;
     await this.store.insert('missions', mission);
     for (const task of tasks) await this.queue.enqueue(task);
@@ -184,6 +197,27 @@ export class Cto {
     return this.getMission(missionId);
   }
 
+  /**
+   * Owner decision that resolves an escalation: every failed task is reopened with fresh counters and the
+   * mission goes back to running. The budget gate still applies, so a budget block simply escalates again
+   * until the owner raises the budget.
+   */
+  async resumeMission(missionId, { by = 'owner', note = '', credentialId = null } = {}) {
+    const mission = await this.#mission(missionId);
+    if (mission.status !== 'blocked') throw new Error(`Only a blocked mission can be resumed, not ${mission.status}`);
+    const tasks = await this.store.list('tasks', { mission_id: missionId });
+    const requeued = [];
+    for (const task of tasks.filter((t) => t.status === 'failed')) {
+      if (await this.queue.retryFailed(task.id)) requeued.push(task.id);
+    }
+    await this.#setMission(mission, 'running', { blockers: [] });
+    await emit(this.store, {
+      mission_id: missionId, type: 'mission_resumed', actor: by,
+      detail: { requeued, credential_id: credentialId, note: redact(String(note).slice(0, 500)) }
+    });
+    return this.getMission(missionId);
+  }
+
   async cancelMission(missionId, { by = 'owner', reason = 'cancelled' } = {}) {
     const mission = await this.#mission(missionId);
     if (TERMINAL_MISSION.has(mission.status)) throw new Error(`Mission already ${mission.status}`);
@@ -196,9 +230,11 @@ export class Cto {
   }
 
   async cleanup(missionId) {
+    const mission = await this.store.get('missions', missionId);
+    if (!mission) return;
     const tasks = await this.store.list('tasks', { mission_id: missionId });
     for (const t of tasks) {
-      await removeWorkspace(this.repoPath, { path: path.join(this.workspacesDir, t.id.slice(0, 8)) });
+      await removeWorkspace(this.#repoFor(mission.project), { path: path.join(this.workspacesDir, t.id.slice(0, 8)) });
     }
   }
 
@@ -436,7 +472,7 @@ export class Cto {
         ].join('\n\n');
       }
       const ws = await ensureWorkspace({
-        repoPath: this.repoPath, baseDir: this.workspacesDir, task, mission, baseRef, detached: role.readOnly
+        repoPath: this.#repoFor(mission.project), baseDir: this.workspacesDir, task, mission, baseRef, detached: role.readOnly
       });
       if (!task.base_commit && ws.base) {
         await this.store.update('tasks', task.id, { base_commit: ws.base });
@@ -687,6 +723,7 @@ export class Cto {
       if (!blocking.length) {
         await this.#setMission(mission, 'review');
         await emit(this.store, { mission_id: missionId, type: 'approval_requested', detail: { kind: 'completion', reviews: reviews.map((r) => `${r.role}:${r.verdict}`) } });
+        if (mission.pull_request && this.github) await this.#syncPullRequest(missionId);
         return;
       }
       const feedback = blocking
@@ -702,6 +739,89 @@ export class Cto {
     } finally {
       this.deciding.delete(missionId);
     }
+  }
+
+  // ----------------------------------------------------------------- GitHub
+
+  /**
+   * Proposes the verified work to the owner: pushes the task branch (fast-forward, CTO branches only) and opens
+   * a DRAFT pull request. Never merges and never deploys: the client has no such capability.
+   */
+  async submitPullRequest(missionId, { by = 'owner', credentialId = null } = {}) {
+    if (!this.github) throw new Error('GitHub is not configured (CTO_GITHUB_TOKEN and CTO_ALLOWED_REPOS)');
+    const mission = await this.#mission(missionId);
+    if (!['review', 'completed'].includes(mission.status)) {
+      throw new Error(`A pull request can only be opened for a mission in review or completed, not ${mission.status}`);
+    }
+    if (!this.github.isAllowed(mission.project)) throw new Error('Repository is not authorized for GitHub operations');
+    const lock = Date.parse(mission.pull_request_lock ?? 0);
+    if (Date.now() - lock < 60000) throw Object.assign(new Error('A pull request is already being opened for this mission'), { status: 409 });
+    const locked = await this.store.cas('missions', missionId, { rev: mission.rev }, { pull_request_lock: nowIso() });
+    if (!locked) throw Object.assign(new Error('Mission changed concurrently, retry'), { status: 409 });
+    try {
+      const backend = await this.#latestBackend(missionId);
+      const ev = backend?.evidence;
+      if (!ev?.commit || !ev?.branch) throw new Error('No verified commit to propose');
+      await this.github.pushBranch({ repoPath: this.#repoFor(mission.project), project: mission.project, branch: ev.branch, commit: ev.commit });
+      let pr = mission.pull_request;
+      if (pr) {
+        pr = { ...pr, commit: ev.commit };
+        await emit(this.store, { mission_id: missionId, type: 'pull_request_updated', actor: by, detail: { number: pr.number, commit: ev.commit, credential_id: credentialId } });
+      } else {
+        const base = await this.github.defaultBranch(mission.project);
+        const report = await this.consolidatedReport(missionId);
+        const opened = await this.github.openDraftPullRequest({
+          project: mission.project, head: ev.branch, base,
+          title: `[CTO IA] ${mission.objective.slice(0, 80).replace(/\s+/g, ' ')}`, body: report.pull_request_body
+        });
+        pr = { ...opened, branch: ev.branch, base, commit: ev.commit, opened_at: nowIso() };
+        await emit(this.store, { mission_id: missionId, type: 'pull_request_opened', actor: by, detail: { number: pr.number, url: pr.url, draft: pr.draft, commit: ev.commit, credential_id: credentialId } });
+      }
+      await this.store.update('missions', missionId, { pull_request: pr });
+      return pr;
+    } finally {
+      await this.store.update('missions', missionId, { pull_request_lock: null });
+    }
+  }
+
+  /** After a rework, the corrected commit goes to the already opened draft PR (same branch, fast-forward). */
+  async #syncPullRequest(missionId) {
+    try {
+      await this.submitPullRequest(missionId, { by: 'cto' });
+    } catch (error) {
+      await emit(this.store, { mission_id: missionId, type: 'pull_request_sync_failed', detail: { error: redact(error.message) } });
+    }
+  }
+
+  /**
+   * Reads the CI result of the proposed commit. A failing CI sends the work back to the backend with the
+   * failing checks as feedback (bounded by maxCorrections, then escalated). Missing or pending checks are
+   * never treated as success.
+   */
+  async checkCi(missionId) {
+    if (!this.github) throw new Error('GitHub is not configured (CTO_GITHUB_TOKEN and CTO_ALLOWED_REPOS)');
+    const mission = await this.#mission(missionId);
+    const pr = mission.pull_request;
+    if (!pr) throw new Error('No pull request has been opened for this mission');
+    const result = await this.github.commitChecks(mission.project, pr.commit);
+    await emit(this.store, {
+      mission_id: missionId, type: 'ci_status',
+      detail: { state: result.state, commit: pr.commit, checks: result.checks.map((c) => `${c.name}:${c.state}`) }
+    });
+    if (result.state !== 'failure' || mission.status !== 'review') return { ...result, action: 'none' };
+
+    const tasks = await this.store.list('tasks', { mission_id: missionId });
+    const backend = tasks.find((t) => t.role === 'backend');
+    const failing = result.checks.filter((c) => c.state === 'failure');
+    const feedback = `Continuous integration failed on commit ${pr.commit}. Fix every failing check, keep the local tests green:\n${failing.map((c) => `- ${c.name}: ${c.detail}`).join('\n')}`;
+    await this.#setMission(mission, 'running');
+    if (backend.corrections >= this.maxCorrections) {
+      await this.#block(missionId, `CI still failing after ${this.maxCorrections} rework rounds: ${failing[0].name}`);
+      return { ...result, action: 'escalated' };
+    }
+    await this.queue.reopenForRework(backend.id, feedback);
+    await emit(this.store, { mission_id: missionId, type: 'ci_rework_requested', detail: { failing: failing.map((c) => c.name), round: backend.corrections + 1 } });
+    return { ...result, action: 'rework_requested' };
   }
 
   // --------------------------------------------------------------- reporting

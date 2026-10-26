@@ -1,5 +1,5 @@
 import { emit } from './events.js';
-import { validateTaskTransition } from './core.js';
+import { validateTaskTransition, validateOwnerRetry } from './core.js';
 
 const CLAIMABLE_MISSION = new Set(['approved', 'running']);
 
@@ -192,6 +192,21 @@ export class JobQueue {
       detail: { role: task.role, round: reopened.corrections }
     });
     return reopened;
+  }
+
+  /**
+   * Owner resume: reopens a failed task with fresh failure and correction counters (attempts stay monotonic, so
+   * fencing still tells the old attempts apart). The last rejection feedback is kept for the specialist.
+   */
+  async retryFailed(taskId) {
+    const task = await this.store.get('tasks', taskId);
+    if (!task) return null;
+    validateOwnerRetry(task.status);
+    return this.store.cas('tasks', taskId, { status: 'failed' }, {
+      status: validateOwnerRetry('failed'), failures: 0, corrections: 0, error: null, not_before: null,
+      finished_at: null, lease_expires_at: null, worker_id: null, slot_state: null,
+      feedback: task.feedback ?? (task.error ? `Previous attempt failed: ${task.error}` : null)
+    });
   }
 
   async failPermanently(taskId, error, from = 'review') {
