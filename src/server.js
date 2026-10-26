@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ROLES } from './core.js';
 import { Cto } from './cto.js';
 import { storeFromEnv } from './store/index.js';
+import { createHash } from 'node:crypto';
 import { safeEqual, redact } from './util.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -90,12 +91,14 @@ export function createServer({
     res.end(JSON.stringify(data));
   };
 
+  // A short fingerprint identifies which credential made a request without ever storing the credential.
+  const fingerprint = (token) => createHash('sha256').update(token).digest('hex').slice(0, 8);
   const authenticate = (req) => {
     const header = req.headers.authorization ?? '';
     if (!header.startsWith('Bearer ')) return null;
     const token = header.slice(7);
-    if (safeEqual(token, adminToken)) return 'owner';
-    if (viewerToken && safeEqual(token, viewerToken)) return 'viewer';
+    if (safeEqual(token, adminToken)) return { role: 'owner', credentialId: fingerprint(token) };
+    if (viewerToken && safeEqual(token, viewerToken)) return { role: 'viewer', credentialId: fingerprint(token) };
     return null;
   };
 
@@ -111,8 +114,9 @@ export function createServer({
     if (!pathname.startsWith('/api/')) throw new HttpError(404, 'Not found');
 
     const ip = req.socket.remoteAddress ?? 'unknown';
-    const role = authenticate(req);
-    if (!role) {
+    const identity = authenticate(req);
+    const role = identity?.role;
+    if (!identity) {
       if (!allowFailedAuth(ip)) throw new HttpError(429, 'Too many failed attempts');
       throw new HttpError(401, 'Unauthorized');
     }
@@ -161,7 +165,7 @@ export function createServer({
 
     const body = await readJson(req);
     if (action === 'approvals') {
-      return send(res, 200, await cto.approve(id, { kind: body.kind, decision: body.decision, note: body.note, by: role }));
+      return send(res, 200, await cto.approve(id, { kind: body.kind, decision: body.decision, note: body.note, by: role, credentialId: identity.credentialId }));
     }
     if (action === 'budget') return send(res, 200, await cto.raiseBudget(id, body.budget_usd, { by: role }));
     if (action === 'cancel') return send(res, 200, await cto.cancelMission(id, { by: role, reason: body.reason ?? 'cancelled by owner' }));

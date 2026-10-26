@@ -15,6 +15,8 @@ const TABLE_NAMES = Object.freeze({
 });
 
 const enc = encodeURIComponent;
+const PAGE_SIZE = 500;
+const MAX_LIST_ROWS = 500000;
 
 export class SupabaseStore {
   constructor({ url, serviceRoleKey, fetchImpl = globalThis.fetch, timeoutMs = 15000 }) {
@@ -113,11 +115,23 @@ export class SupabaseStore {
     return SupabaseStore.#toDomain(updated[0]);
   }
 
+  /**
+   * Lists every matching row. PostgREST/Supabase caps a single response (1000 rows by default), so the
+   * rows are read page by page with a stable order until an empty page comes back: a lower server cap
+   * than PAGE_SIZE is therefore harmless, and nothing is silently dropped.
+   */
   async list(table, filter = {}) {
     const query = ['select=*', 'order=created_at.asc,id.asc'];
     if (filter.mission_id) query.push(`mission_id=eq.${enc(filter.mission_id)}`);
     if (filter.status) query.push(`status=eq.${enc(filter.status)}`);
-    const rows = await this.#request('GET', `${this.#name(table)}?${query.join('&')}`);
+    const rows = [];
+    for (let offset = 0; ; ) {
+      const page = await this.#request('GET', `${this.#name(table)}?${query.join('&')}&limit=${PAGE_SIZE}&offset=${offset}`);
+      if (!Array.isArray(page) || page.length === 0) break;
+      rows.push(...page);
+      offset += page.length;
+      if (rows.length > MAX_LIST_ROWS) throw new Error(`Supabase list of ${this.#name(table)} exceeds ${MAX_LIST_ROWS} rows`);
+    }
     return rows
       .map((r) => SupabaseStore.#toDomain(r))
       .filter((row) => Object.entries(filter).every(([k, v]) => row[k] === v));

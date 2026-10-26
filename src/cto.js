@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { planMission, validateTransition, validateReport, ROLES, TERMINAL_MISSION, REVIEWER_ROLES } from './core.js';
 import { JobQueue } from './queue.js';
@@ -12,6 +12,15 @@ import {
 import { redact, nowIso, sleep } from './util.js';
 
 const APPROVAL_KINDS = ['mission', 'architecture', 'completion'];
+
+/**
+ * One decision per (mission, kind): the id is derived from both, so a double submit, a retry after a crash
+ * or two concurrent requests all address the same row and can never record two decisions.
+ */
+export function approvalId(missionId, kind) {
+  const h = createHash('sha256').update(`cto-approval:${missionId}:${kind}`).digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
 
 function validateAcceptance(acceptance) {
   if (acceptance == null) return null;
@@ -43,6 +52,7 @@ export class Cto {
     this.workspacesDir = path.resolve(workspacesDir ?? path.join(this.repoPath, '..', '.cto-workspaces'));
     this.workerId = workerId;
     this.maxCorrections = limits.maxCorrections ?? 2;
+    this.reconcileGraceMs = limits.reconcileGraceMs ?? 5000;
     this.queue = new JobQueue({
       store,
       leaseMs: limits.leaseMs ?? 120000,
@@ -119,8 +129,12 @@ export class Cto {
 
   // --------------------------------------------------------------- approvals
 
-  /** Records an explicit, audited owner decision and applies its state change. */
-  async approve(missionId, { kind, decision, by = 'owner', note = '' }) {
+  /**
+   * Records an explicit, audited owner decision and applies its state change. Idempotent: the decision row has
+   * a deterministic id, so repeating the same decision (retry after a crash, double click) resumes the
+   * transition instead of recording a second decision; a different decision for the same kind is refused.
+   */
+  async approve(missionId, { kind, decision, by = 'owner', note = '', credentialId = null }) {
     if (!APPROVAL_KINDS.includes(kind)) throw new Error('Unknown approval kind');
     if (!['approve', 'reject'].includes(decision)) throw new Error('Decision must be approve or reject');
     const mission = await this.#mission(missionId);
@@ -128,10 +142,20 @@ export class Cto {
     if (mission.status !== required) {
       throw new Error(`Cannot record a ${kind} approval while the mission is ${mission.status}`);
     }
-    await this.store.insert('approvals', {
-      id: randomUUID(), mission_id: missionId, kind, decision, by, note: redact(String(note).slice(0, 500)), at: nowIso()
-    });
-    await emit(this.store, { mission_id: missionId, type: 'approval_recorded', actor: by, detail: { kind, decision } });
+    const id = approvalId(missionId, kind);
+    try {
+      await this.store.insert('approvals', {
+        id, mission_id: missionId, kind, decision, by, credential_id: credentialId, note: redact(String(note).slice(0, 500)), at: nowIso()
+      });
+      await emit(this.store, { mission_id: missionId, type: 'approval_recorded', actor: by, detail: { kind, decision } });
+    } catch (error) {
+      const existing = await this.store.get('approvals', id);
+      if (!existing) throw error;
+      if (existing.decision !== decision) {
+        throw Object.assign(new Error(`A different ${kind} decision (${existing.decision}) is already recorded`), { status: 409 });
+      }
+      // Same decision already recorded: fall through and (re)apply the state change.
+    }
 
     if (decision === 'reject') return this.cancelMission(missionId, { by, reason: `${kind} rejected` });
     if (kind === 'mission') await this.#setMission(mission, 'approved');
@@ -234,6 +258,7 @@ export class Cto {
         if (task) await this.#recordCost(mission, { ...task, reservation_id: token, reserved_usd: reservation.usd }, null);
       }
     }
+    await this.reconcile();
     const launched = [];
     for (;;) {
       const task = await this.queue.claimNext({ workerId: this.workerId, accept: (t) => this.#affordable(t),
@@ -245,6 +270,57 @@ export class Cto {
     }
     if (wait) await Promise.all([...this.inflight]);
     return launched.length;
+  }
+
+  /**
+   * Repairs the windows where a crash (or a lost race) left the mission graph half-advanced: a step was written
+   * (approval, task done) but the follow-up transition never happened. Every repair is an idempotent
+   * compare-and-set derived only from persisted facts, so running it on every tick is safe, and a restarted
+   * process picks missions up exactly where the persisted state says they are.
+   */
+  async reconcile() {
+    const repaired = [];
+    for (const mission of await this.store.list('missions')) {
+      if (mission.status !== 'running') continue;
+      if (Date.now() - Date.parse(mission.updated_at ?? 0) < this.reconcileGraceMs) continue;
+      const tasks = await this.store.list('tasks', { mission_id: mission.id });
+      if (tasks.some((t) => this.controllers.has(t.id))) continue; // this process is still concluding one of them
+      try {
+        const approvals = await this.store.list('approvals', { mission_id: mission.id });
+        const granted = (kind) => approvals.some((a) => a.kind === kind && a.decision === 'approve');
+        const byId = new Map(tasks.map((t) => [t.id, t]));
+        const architect = tasks.find((t) => t.role === 'architect');
+        const backend = tasks.find((t) => t.role === 'backend');
+
+        // A plan was verified but the owner was never asked.
+        if (architect?.status === 'done' && backend?.status === 'waiting' && !granted('architecture')) {
+          await this.#setMission(mission, 'awaiting_owner');
+          if (!(await this.store.list('events', { mission_id: mission.id })).some((e) => e.type === 'approval_requested' && e.detail?.kind === 'architecture')) {
+            await emit(this.store, { mission_id: mission.id, type: 'approval_requested', detail: { kind: 'architecture' } });
+          }
+          repaired.push({ mission: mission.id, repair: 'architecture_approval_requested' });
+          continue;
+        }
+        // The owner approved but the gated task was never released, or a verified backend never released its reviewers.
+        for (const t of tasks.filter((x) => x.status === 'waiting')) {
+          const dependencyDone = !t.depends_on || byId.get(t.depends_on)?.status === 'done';
+          const gate = !t.requires_approval || granted(t.requires_approval);
+          if (dependencyDone && gate && await this.store.cas('tasks', t.id, { status: 'waiting' }, { status: 'queued' })) {
+            repaired.push({ mission: mission.id, task: t.id, repair: 'released' });
+          }
+        }
+        // Every reviewer finished but nobody decided what happens next.
+        const reviewers = tasks.filter((t) => REVIEWER_ROLES.includes(t.role));
+        if (reviewers.length && reviewers.every((t) => t.status === 'done')) {
+          await this.#decideAfterReviews(mission.id);
+          repaired.push({ mission: mission.id, repair: 'review_decision' });
+        }
+      } catch (error) {
+        await emit(this.store, { mission_id: mission.id, type: 'reconcile_error', detail: { error: redact(error.message) } });
+      }
+    }
+    for (const r of repaired) await emit(this.store, { mission_id: r.mission, task_id: r.task ?? null, type: 'reconciled', detail: { repair: r.repair } });
+    return repaired;
   }
 
   /** Runs until nothing is dispatchable (waiting for approval, blocked, or finished). */
@@ -334,7 +410,15 @@ export class Cto {
     let runnerStarted = false;
     const controller = new AbortController();
     this.controllers.set(task.id, controller);
-    const beat = setInterval(() => { this.queue.heartbeat(task.id, this.workerId).catch(() => {}); }, Math.max(200, this.queue.leaseMs / 3));
+    const fence = { workerId: this.workerId, attempt: task.attempts };
+    let leaseLost = false;
+    // The lease is only needed while the agent runs. A heartbeat that finds the task re-leased (or recovered)
+    // means another attempt owns it: stop the agent instead of letting two of them work on the same task.
+    const beat = setInterval(() => {
+      this.queue.heartbeat(task.id, this.workerId, Date.now(), task.attempts).then((alive) => {
+        if (!alive && !leaseLost && !controller.signal.aborted) { leaseLost = true; controller.abort(); }
+      }).catch(() => {});
+    }, Math.max(200, this.queue.leaseMs / 3));
     beat.unref?.();
     try {
       let mission = await this.#mission(task.mission_id);
@@ -376,7 +460,10 @@ export class Cto {
       });
       const cost = await this.#recordCost(mission, task, result);
       costRecorded = true;
-      if (!(await this.queue.toReview(task.id))) return; // cancelled while running
+      clearInterval(beat);
+      if (leaseLost) throw new Error('lease lost');
+      // Fenced: refused when the mission was cancelled or when this attempt no longer owns the task.
+      if (!(await this.queue.toReview(task.id, {}, fence))) return;
       const verdict = await this.#verify(task, mission, ws, result);
       await this.#conclude(task, mission, ws, result, verdict, cost);
     } catch (error) {
@@ -384,6 +471,11 @@ export class Cto {
       if (!costRecorded) {
         if (runnerStarted) await this.#recordCost(await this.#mission(task.mission_id), task, null);
         else await this.#releaseReservation(task.mission_id, task.reservation_id);
+      }
+      if (leaseLost) {
+        // The task belongs to another attempt now; this one must not touch its state.
+        await emit(this.store, { mission_id: task.mission_id, task_id: task.id, type: 'lease_lost', actor: this.workerId, detail: { attempt: task.attempts } });
+        return;
       }
       if (error.cancelled || controller.signal.aborted) {
         await emit(this.store, { mission_id: task.mission_id, task_id: task.id, type: 'task_cancelled' });
@@ -396,7 +488,7 @@ export class Cto {
         await this.#block(task.mission_id, `Verification failed safely: ${message}`);
         return;
       }
-      const outcome = await this.queue.retryOrFail(task.id, message);
+      const outcome = await this.queue.retryOrFail(task.id, message, Date.now(), fence);
       if (outcome === 'failed') await this.#block(task.mission_id, `Task ${task.role} failed after retries: ${message}`);
     } finally {
       clearInterval(beat);
