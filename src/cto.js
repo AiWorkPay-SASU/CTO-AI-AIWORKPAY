@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { planMission, validateTransition, validateReport, ROLES, TERMINAL_MISSION, REVIEWER_ROLES } from './core.js';
 import { JobQueue } from './queue.js';
@@ -12,6 +12,15 @@ import {
 import { redact, nowIso, sleep } from './util.js';
 
 const APPROVAL_KINDS = ['mission', 'architecture', 'completion'];
+
+/**
+ * One decision per (mission, kind): the id is derived from both, so a double submit, a retry after a crash
+ * or two concurrent requests all address the same row and can never record two decisions.
+ */
+export function approvalId(missionId, kind) {
+  const h = createHash('sha256').update(`cto-approval:${missionId}:${kind}`).digest('hex');
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-5${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
 
 function validateAcceptance(acceptance) {
   if (acceptance == null) return null;
@@ -32,17 +41,23 @@ function validateAcceptance(acceptance) {
  */
 export class Cto {
   constructor({
-    store, runner = runClaude, testRunner = runTests, repoPath, workspacesDir, workerId = 'cto-worker-1', limits = {}
+    store, runner = runClaude, testRunner = runTests, repoPath, repos = null, github = null, workspacesDir,
+    workerId = 'cto-worker-1', limits = {}
   }) {
     if (!store) throw new Error('store required');
-    if (!repoPath) throw new Error('repoPath required');
+    if (!repoPath && !repos) throw new Error('repoPath required');
     this.store = store;
     this.runner = runner;
     this.testRunner = testRunner;
-    this.repoPath = path.resolve(repoPath);
+    // `repos` maps "owner/repo" to a local checkout and doubles as the allowlist of projects the CTO may work on.
+    this.repos = repos ? new Map(Object.entries(repos).map(([project, dir]) => [project, path.resolve(dir)])) : null;
+    if (this.repos && !this.repos.size) throw new Error('repos must not be empty');
+    this.repoPath = path.resolve(repoPath ?? [...this.repos.values()][0]);
+    this.github = github;
     this.workspacesDir = path.resolve(workspacesDir ?? path.join(this.repoPath, '..', '.cto-workspaces'));
     this.workerId = workerId;
     this.maxCorrections = limits.maxCorrections ?? 2;
+    this.reconcileGraceMs = limits.reconcileGraceMs ?? 5000;
     this.queue = new JobQueue({
       store,
       leaseMs: limits.leaseMs ?? 120000,
@@ -58,11 +73,19 @@ export class Cto {
 
   // ---------------------------------------------------------------- missions
 
+  #repoFor(project) {
+    if (!this.repos) return this.repoPath;
+    const dir = this.repos.get(project);
+    if (!dir) throw new Error('Project is not an authorized repository');
+    return dir;
+  }
+
   async createMission({ objective, project, budgetUsd, acceptance }) {
     const plan = planMission(objective, project, {
       ...(budgetUsd === undefined ? {} : { budgetUsd }),
       acceptance: validateAcceptance(acceptance)
     });
+    this.#repoFor(plan.project);
     const { tasks, ...mission } = plan;
     await this.store.insert('missions', mission);
     for (const task of tasks) await this.queue.enqueue(task);
@@ -119,8 +142,12 @@ export class Cto {
 
   // --------------------------------------------------------------- approvals
 
-  /** Records an explicit, audited owner decision and applies its state change. */
-  async approve(missionId, { kind, decision, by = 'owner', note = '' }) {
+  /**
+   * Records an explicit, audited owner decision and applies its state change. Idempotent: the decision row has
+   * a deterministic id, so repeating the same decision (retry after a crash, double click) resumes the
+   * transition instead of recording a second decision; a different decision for the same kind is refused.
+   */
+  async approve(missionId, { kind, decision, by = 'owner', note = '', credentialId = null }) {
     if (!APPROVAL_KINDS.includes(kind)) throw new Error('Unknown approval kind');
     if (!['approve', 'reject'].includes(decision)) throw new Error('Decision must be approve or reject');
     const mission = await this.#mission(missionId);
@@ -128,10 +155,20 @@ export class Cto {
     if (mission.status !== required) {
       throw new Error(`Cannot record a ${kind} approval while the mission is ${mission.status}`);
     }
-    await this.store.insert('approvals', {
-      id: randomUUID(), mission_id: missionId, kind, decision, by, note: redact(String(note).slice(0, 500)), at: nowIso()
-    });
-    await emit(this.store, { mission_id: missionId, type: 'approval_recorded', actor: by, detail: { kind, decision } });
+    const id = approvalId(missionId, kind);
+    try {
+      await this.store.insert('approvals', {
+        id, mission_id: missionId, kind, decision, by, credential_id: credentialId, note: redact(String(note).slice(0, 500)), at: nowIso()
+      });
+      await emit(this.store, { mission_id: missionId, type: 'approval_recorded', actor: by, detail: { kind, decision } });
+    } catch (error) {
+      const existing = await this.store.get('approvals', id);
+      if (!existing) throw error;
+      if (existing.decision !== decision) {
+        throw Object.assign(new Error(`A different ${kind} decision (${existing.decision}) is already recorded`), { status: 409 });
+      }
+      // Same decision already recorded: fall through and (re)apply the state change.
+    }
 
     if (decision === 'reject') return this.cancelMission(missionId, { by, reason: `${kind} rejected` });
     if (kind === 'mission') await this.#setMission(mission, 'approved');
@@ -160,6 +197,27 @@ export class Cto {
     return this.getMission(missionId);
   }
 
+  /**
+   * Owner decision that resolves an escalation: every failed task is reopened with fresh counters and the
+   * mission goes back to running. The budget gate still applies, so a budget block simply escalates again
+   * until the owner raises the budget.
+   */
+  async resumeMission(missionId, { by = 'owner', note = '', credentialId = null } = {}) {
+    const mission = await this.#mission(missionId);
+    if (mission.status !== 'blocked') throw new Error(`Only a blocked mission can be resumed, not ${mission.status}`);
+    const tasks = await this.store.list('tasks', { mission_id: missionId });
+    const requeued = [];
+    for (const task of tasks.filter((t) => t.status === 'failed')) {
+      if (await this.queue.retryFailed(task.id)) requeued.push(task.id);
+    }
+    await this.#setMission(mission, 'running', { blockers: [] });
+    await emit(this.store, {
+      mission_id: missionId, type: 'mission_resumed', actor: by,
+      detail: { requeued, credential_id: credentialId, note: redact(String(note).slice(0, 500)) }
+    });
+    return this.getMission(missionId);
+  }
+
   async cancelMission(missionId, { by = 'owner', reason = 'cancelled' } = {}) {
     const mission = await this.#mission(missionId);
     if (TERMINAL_MISSION.has(mission.status)) throw new Error(`Mission already ${mission.status}`);
@@ -172,9 +230,11 @@ export class Cto {
   }
 
   async cleanup(missionId) {
+    const mission = await this.store.get('missions', missionId);
+    if (!mission) return;
     const tasks = await this.store.list('tasks', { mission_id: missionId });
     for (const t of tasks) {
-      await removeWorkspace(this.repoPath, { path: path.join(this.workspacesDir, t.id.slice(0, 8)) });
+      await removeWorkspace(this.#repoFor(mission.project), { path: path.join(this.workspacesDir, t.id.slice(0, 8)) });
     }
   }
 
@@ -234,6 +294,7 @@ export class Cto {
         if (task) await this.#recordCost(mission, { ...task, reservation_id: token, reserved_usd: reservation.usd }, null);
       }
     }
+    await this.reconcile();
     const launched = [];
     for (;;) {
       const task = await this.queue.claimNext({ workerId: this.workerId, accept: (t) => this.#affordable(t),
@@ -245,6 +306,57 @@ export class Cto {
     }
     if (wait) await Promise.all([...this.inflight]);
     return launched.length;
+  }
+
+  /**
+   * Repairs the windows where a crash (or a lost race) left the mission graph half-advanced: a step was written
+   * (approval, task done) but the follow-up transition never happened. Every repair is an idempotent
+   * compare-and-set derived only from persisted facts, so running it on every tick is safe, and a restarted
+   * process picks missions up exactly where the persisted state says they are.
+   */
+  async reconcile() {
+    const repaired = [];
+    for (const mission of await this.store.list('missions')) {
+      if (mission.status !== 'running') continue;
+      if (Date.now() - Date.parse(mission.updated_at ?? 0) < this.reconcileGraceMs) continue;
+      const tasks = await this.store.list('tasks', { mission_id: mission.id });
+      if (tasks.some((t) => this.controllers.has(t.id))) continue; // this process is still concluding one of them
+      try {
+        const approvals = await this.store.list('approvals', { mission_id: mission.id });
+        const granted = (kind) => approvals.some((a) => a.kind === kind && a.decision === 'approve');
+        const byId = new Map(tasks.map((t) => [t.id, t]));
+        const architect = tasks.find((t) => t.role === 'architect');
+        const backend = tasks.find((t) => t.role === 'backend');
+
+        // A plan was verified but the owner was never asked.
+        if (architect?.status === 'done' && backend?.status === 'waiting' && !granted('architecture')) {
+          await this.#setMission(mission, 'awaiting_owner');
+          if (!(await this.store.list('events', { mission_id: mission.id })).some((e) => e.type === 'approval_requested' && e.detail?.kind === 'architecture')) {
+            await emit(this.store, { mission_id: mission.id, type: 'approval_requested', detail: { kind: 'architecture' } });
+          }
+          repaired.push({ mission: mission.id, repair: 'architecture_approval_requested' });
+          continue;
+        }
+        // The owner approved but the gated task was never released, or a verified backend never released its reviewers.
+        for (const t of tasks.filter((x) => x.status === 'waiting')) {
+          const dependencyDone = !t.depends_on || byId.get(t.depends_on)?.status === 'done';
+          const gate = !t.requires_approval || granted(t.requires_approval);
+          if (dependencyDone && gate && await this.store.cas('tasks', t.id, { status: 'waiting' }, { status: 'queued' })) {
+            repaired.push({ mission: mission.id, task: t.id, repair: 'released' });
+          }
+        }
+        // Every reviewer finished but nobody decided what happens next.
+        const reviewers = tasks.filter((t) => REVIEWER_ROLES.includes(t.role));
+        if (reviewers.length && reviewers.every((t) => t.status === 'done')) {
+          await this.#decideAfterReviews(mission.id);
+          repaired.push({ mission: mission.id, repair: 'review_decision' });
+        }
+      } catch (error) {
+        await emit(this.store, { mission_id: mission.id, type: 'reconcile_error', detail: { error: redact(error.message) } });
+      }
+    }
+    for (const r of repaired) await emit(this.store, { mission_id: r.mission, task_id: r.task ?? null, type: 'reconciled', detail: { repair: r.repair } });
+    return repaired;
   }
 
   /** Runs until nothing is dispatchable (waiting for approval, blocked, or finished). */
@@ -334,7 +446,15 @@ export class Cto {
     let runnerStarted = false;
     const controller = new AbortController();
     this.controllers.set(task.id, controller);
-    const beat = setInterval(() => { this.queue.heartbeat(task.id, this.workerId).catch(() => {}); }, Math.max(200, this.queue.leaseMs / 3));
+    const fence = { workerId: this.workerId, attempt: task.attempts };
+    let leaseLost = false;
+    // The lease is only needed while the agent runs. A heartbeat that finds the task re-leased (or recovered)
+    // means another attempt owns it: stop the agent instead of letting two of them work on the same task.
+    const beat = setInterval(() => {
+      this.queue.heartbeat(task.id, this.workerId, Date.now(), task.attempts).then((alive) => {
+        if (!alive && !leaseLost && !controller.signal.aborted) { leaseLost = true; controller.abort(); }
+      }).catch(() => {});
+    }, Math.max(200, this.queue.leaseMs / 3));
     beat.unref?.();
     try {
       let mission = await this.#mission(task.mission_id);
@@ -352,7 +472,7 @@ export class Cto {
         ].join('\n\n');
       }
       const ws = await ensureWorkspace({
-        repoPath: this.repoPath, baseDir: this.workspacesDir, task, mission, baseRef, detached: role.readOnly
+        repoPath: this.#repoFor(mission.project), baseDir: this.workspacesDir, task, mission, baseRef, detached: role.readOnly
       });
       if (!task.base_commit && ws.base) {
         await this.store.update('tasks', task.id, { base_commit: ws.base });
@@ -376,7 +496,10 @@ export class Cto {
       });
       const cost = await this.#recordCost(mission, task, result);
       costRecorded = true;
-      if (!(await this.queue.toReview(task.id))) return; // cancelled while running
+      clearInterval(beat);
+      if (leaseLost) throw new Error('lease lost');
+      // Fenced: refused when the mission was cancelled or when this attempt no longer owns the task.
+      if (!(await this.queue.toReview(task.id, {}, fence))) return;
       const verdict = await this.#verify(task, mission, ws, result);
       await this.#conclude(task, mission, ws, result, verdict, cost);
     } catch (error) {
@@ -384,6 +507,11 @@ export class Cto {
       if (!costRecorded) {
         if (runnerStarted) await this.#recordCost(await this.#mission(task.mission_id), task, null);
         else await this.#releaseReservation(task.mission_id, task.reservation_id);
+      }
+      if (leaseLost) {
+        // The task belongs to another attempt now; this one must not touch its state.
+        await emit(this.store, { mission_id: task.mission_id, task_id: task.id, type: 'lease_lost', actor: this.workerId, detail: { attempt: task.attempts } });
+        return;
       }
       if (error.cancelled || controller.signal.aborted) {
         await emit(this.store, { mission_id: task.mission_id, task_id: task.id, type: 'task_cancelled' });
@@ -396,7 +524,7 @@ export class Cto {
         await this.#block(task.mission_id, `Verification failed safely: ${message}`);
         return;
       }
-      const outcome = await this.queue.retryOrFail(task.id, message);
+      const outcome = await this.queue.retryOrFail(task.id, message, Date.now(), fence);
       if (outcome === 'failed') await this.#block(task.mission_id, `Task ${task.role} failed after retries: ${message}`);
     } finally {
       clearInterval(beat);
@@ -595,6 +723,7 @@ export class Cto {
       if (!blocking.length) {
         await this.#setMission(mission, 'review');
         await emit(this.store, { mission_id: missionId, type: 'approval_requested', detail: { kind: 'completion', reviews: reviews.map((r) => `${r.role}:${r.verdict}`) } });
+        if (mission.pull_request && this.github) await this.#syncPullRequest(missionId);
         return;
       }
       const feedback = blocking
@@ -610,6 +739,89 @@ export class Cto {
     } finally {
       this.deciding.delete(missionId);
     }
+  }
+
+  // ----------------------------------------------------------------- GitHub
+
+  /**
+   * Proposes the verified work to the owner: pushes the task branch (fast-forward, CTO branches only) and opens
+   * a DRAFT pull request. Never merges and never deploys: the client has no such capability.
+   */
+  async submitPullRequest(missionId, { by = 'owner', credentialId = null } = {}) {
+    if (!this.github) throw new Error('GitHub is not configured (CTO_GITHUB_TOKEN and CTO_ALLOWED_REPOS)');
+    const mission = await this.#mission(missionId);
+    if (!['review', 'completed'].includes(mission.status)) {
+      throw new Error(`A pull request can only be opened for a mission in review or completed, not ${mission.status}`);
+    }
+    if (!this.github.isAllowed(mission.project)) throw new Error('Repository is not authorized for GitHub operations');
+    const lock = Date.parse(mission.pull_request_lock ?? 0);
+    if (Date.now() - lock < 60000) throw Object.assign(new Error('A pull request is already being opened for this mission'), { status: 409 });
+    const locked = await this.store.cas('missions', missionId, { rev: mission.rev }, { pull_request_lock: nowIso() });
+    if (!locked) throw Object.assign(new Error('Mission changed concurrently, retry'), { status: 409 });
+    try {
+      const backend = await this.#latestBackend(missionId);
+      const ev = backend?.evidence;
+      if (!ev?.commit || !ev?.branch) throw new Error('No verified commit to propose');
+      await this.github.pushBranch({ repoPath: this.#repoFor(mission.project), project: mission.project, branch: ev.branch, commit: ev.commit });
+      let pr = mission.pull_request;
+      if (pr) {
+        pr = { ...pr, commit: ev.commit };
+        await emit(this.store, { mission_id: missionId, type: 'pull_request_updated', actor: by, detail: { number: pr.number, commit: ev.commit, credential_id: credentialId } });
+      } else {
+        const base = await this.github.defaultBranch(mission.project);
+        const report = await this.consolidatedReport(missionId);
+        const opened = await this.github.openDraftPullRequest({
+          project: mission.project, head: ev.branch, base,
+          title: `[CTO IA] ${mission.objective.slice(0, 80).replace(/\s+/g, ' ')}`, body: report.pull_request_body
+        });
+        pr = { ...opened, branch: ev.branch, base, commit: ev.commit, opened_at: nowIso() };
+        await emit(this.store, { mission_id: missionId, type: 'pull_request_opened', actor: by, detail: { number: pr.number, url: pr.url, draft: pr.draft, commit: ev.commit, credential_id: credentialId } });
+      }
+      await this.store.update('missions', missionId, { pull_request: pr });
+      return pr;
+    } finally {
+      await this.store.update('missions', missionId, { pull_request_lock: null });
+    }
+  }
+
+  /** After a rework, the corrected commit goes to the already opened draft PR (same branch, fast-forward). */
+  async #syncPullRequest(missionId) {
+    try {
+      await this.submitPullRequest(missionId, { by: 'cto' });
+    } catch (error) {
+      await emit(this.store, { mission_id: missionId, type: 'pull_request_sync_failed', detail: { error: redact(error.message) } });
+    }
+  }
+
+  /**
+   * Reads the CI result of the proposed commit. A failing CI sends the work back to the backend with the
+   * failing checks as feedback (bounded by maxCorrections, then escalated). Missing or pending checks are
+   * never treated as success.
+   */
+  async checkCi(missionId) {
+    if (!this.github) throw new Error('GitHub is not configured (CTO_GITHUB_TOKEN and CTO_ALLOWED_REPOS)');
+    const mission = await this.#mission(missionId);
+    const pr = mission.pull_request;
+    if (!pr) throw new Error('No pull request has been opened for this mission');
+    const result = await this.github.commitChecks(mission.project, pr.commit);
+    await emit(this.store, {
+      mission_id: missionId, type: 'ci_status',
+      detail: { state: result.state, commit: pr.commit, checks: result.checks.map((c) => `${c.name}:${c.state}`) }
+    });
+    if (result.state !== 'failure' || mission.status !== 'review') return { ...result, action: 'none' };
+
+    const tasks = await this.store.list('tasks', { mission_id: missionId });
+    const backend = tasks.find((t) => t.role === 'backend');
+    const failing = result.checks.filter((c) => c.state === 'failure');
+    const feedback = `Continuous integration failed on commit ${pr.commit}. Fix every failing check, keep the local tests green:\n${failing.map((c) => `- ${c.name}: ${c.detail}`).join('\n')}`;
+    await this.#setMission(mission, 'running');
+    if (backend.corrections >= this.maxCorrections) {
+      await this.#block(missionId, `CI still failing after ${this.maxCorrections} rework rounds: ${failing[0].name}`);
+      return { ...result, action: 'escalated' };
+    }
+    await this.queue.reopenForRework(backend.id, feedback);
+    await emit(this.store, { mission_id: missionId, type: 'ci_rework_requested', detail: { failing: failing.map((c) => c.name), round: backend.corrections + 1 } });
+    return { ...result, action: 'rework_requested' };
   }
 
   // --------------------------------------------------------------- reporting

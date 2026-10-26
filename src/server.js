@@ -5,6 +5,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ROLES } from './core.js';
 import { Cto } from './cto.js';
 import { storeFromEnv } from './store/index.js';
+import { githubFromEnv } from './github.js';
+import { createHash } from 'node:crypto';
 import { safeEqual, redact } from './util.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -90,12 +92,14 @@ export function createServer({
     res.end(JSON.stringify(data));
   };
 
+  // A short fingerprint identifies which credential made a request without ever storing the credential.
+  const fingerprint = (token) => createHash('sha256').update(token).digest('hex').slice(0, 8);
   const authenticate = (req) => {
     const header = req.headers.authorization ?? '';
     if (!header.startsWith('Bearer ')) return null;
     const token = header.slice(7);
-    if (safeEqual(token, adminToken)) return 'owner';
-    if (viewerToken && safeEqual(token, viewerToken)) return 'viewer';
+    if (safeEqual(token, adminToken)) return { role: 'owner', credentialId: fingerprint(token) };
+    if (viewerToken && safeEqual(token, viewerToken)) return { role: 'viewer', credentialId: fingerprint(token) };
     return null;
   };
 
@@ -111,8 +115,9 @@ export function createServer({
     if (!pathname.startsWith('/api/')) throw new HttpError(404, 'Not found');
 
     const ip = req.socket.remoteAddress ?? 'unknown';
-    const role = authenticate(req);
-    if (!role) {
+    const identity = authenticate(req);
+    const role = identity?.role;
+    if (!identity) {
       if (!allowFailedAuth(ip)) throw new HttpError(429, 'Too many failed attempts');
       throw new HttpError(401, 'Unauthorized');
     }
@@ -122,7 +127,7 @@ export function createServer({
       if (role !== 'owner') throw new HttpError(403, 'Read-only token');
     }
 
-    if (pathname === '/api/whoami' && method === 'GET') return send(res, 200, { role });
+    if (pathname === '/api/whoami' && method === 'GET') return send(res, 200, { role, credential_id: identity.credentialId, github: Boolean(cto.github) });
     if (pathname === '/api/agents' && method === 'GET') {
       const running = await cto.store.list('tasks', { status: 'running' });
       return send(res, 200, Object.entries(ROLES).map(([name, def]) => ({
@@ -161,9 +166,12 @@ export function createServer({
 
     const body = await readJson(req);
     if (action === 'approvals') {
-      return send(res, 200, await cto.approve(id, { kind: body.kind, decision: body.decision, note: body.note, by: role }));
+      return send(res, 200, await cto.approve(id, { kind: body.kind, decision: body.decision, note: body.note, by: role, credentialId: identity.credentialId }));
     }
     if (action === 'budget') return send(res, 200, await cto.raiseBudget(id, body.budget_usd, { by: role }));
+    if (action === 'resume') return send(res, 200, await cto.resumeMission(id, { by: role, note: body.note, credentialId: identity.credentialId }));
+    if (action === 'pr') return send(res, 200, await cto.submitPullRequest(id, { by: role, credentialId: identity.credentialId }));
+    if (action === 'ci') return send(res, 200, await cto.checkCi(id));
     if (action === 'cancel') return send(res, 200, await cto.cancelMission(id, { by: role, reason: body.reason ?? 'cancelled by owner' }));
     if (action === 'run') {
       if (!(await cto.store.get('missions', id))) throw new HttpError(404, 'Not found');
@@ -192,9 +200,12 @@ export function createServer({
 }
 
 export function ctoFromEnv(env = process.env) {
+  // CTO_REPOS: JSON {"owner/repo": "/path/to/checkout"}; it is also the allowlist of projects.
+  const repos = env.CTO_REPOS ? JSON.parse(env.CTO_REPOS) : null;
   return new Cto({
     store: storeFromEnv(env),
-    repoPath: env.CTO_REPO_PATH || process.cwd(),
+    github: githubFromEnv(env),
+    ...(repos ? { repos } : { repoPath: env.CTO_REPO_PATH || process.cwd() }),
     workspacesDir: env.CTO_WORKSPACES_DIR,
     limits: { maxConcurrent: Number(env.CTO_MAX_CONCURRENT || 2) }
   });

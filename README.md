@@ -28,20 +28,23 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 ### API (all `/api` routes need `Authorization: Bearer <token>`)
 `GET /api/missions` · `POST /api/missions {project, objective, budget_usd?, acceptance?}` · `GET /api/missions/:id` ·
 `GET /api/missions/:id/events` · `GET /api/missions/:id/report` · `POST /api/missions/:id/approvals {kind: mission|architecture|completion, decision: approve|reject, note?}` ·
-`POST /api/missions/:id/budget {budget_usd}` · `POST /api/missions/:id/cancel` · `POST /api/missions/:id/run[?wait=1]` · `GET /api/agents` · `GET /api/whoami`.
+`POST /api/missions/:id/budget {budget_usd}` · `POST /api/missions/:id/cancel` · `POST /api/missions/:id/run[?wait=1]` · `POST /api/missions/:id/resume` (owner, after an escalation) · `POST /api/missions/:id/pr` (draft PR) · `POST /api/missions/:id/ci` (read CI, rework on failure) · `GET /api/agents` · `GET /api/whoami`.
+Environment for several projects / GitHub: `CTO_REPOS` (JSON `{"owner/name": "/path/to/clone"}`, doubles as the project allowlist), `CTO_GITHUB_TOKEN`, `CTO_ALLOWED_REPOS`. See [docs/OPERATIONS.md](docs/OPERATIONS.md).
 `GET /health` is public. MissionControl is served on `/` (token kept in memory only).
 
 ## Verification status (what was really run, what was not)
+Measured on branch `audit/cto-reliability-2026-10-26`, Node 22.23: `npm run check` = 144 tests, 142 pass, 0 fail, 2 skipped (see below). Details and the mapping of the 12 acceptance scenarios: [docs/RECETTE.md](docs/RECETTE.md); audit findings: [docs/AUDIT_2026-10-26.md](docs/AUDIT_2026-10-26.md).
+
 | Item | Status |
 |---|---|
-| `npm run lint`, `npm run scan`, `npm test` (93 tests) | **Run locally, green** (Node 22.22). GitHub Actions (`Tests` workflow) passed on the previous commits; the result for the latest push is shown in the PR checks. |
-| Real Claude invocation on an isolated test repo with all four agents: objective → delegation → execution → report → CTO control → verified commit → parallel QA + security review | **Run, succeeded** — evidence in [docs/DEMO_EVIDENCE.md](docs/DEMO_EVIDENCE.md) |
-| Correction loop and review-triggered rework | Covered by tests with scripted agent doubles that modify real worktrees. **Not triggered in the live run** (every agent passed first time). |
-| Restart recovery, cancellation, retries, budget stop, approval gates, concurrency limit | Covered by tests (real git worktrees, real files; agents scripted) |
-| `SupabaseStore` | Tested only against a **simulated PostgREST** server (`testkit/fake-postgrest.js`). **Never run against a real Supabase project.** |
-| `supabase/migrations/001_init.sql` | Written, **not applied** to any project. The only project reachable from this session (`zeeroo`) is unrelated and was not touched. A dedicated dev project is needed (creating one has a cost: owner decision). |
-| MissionControl UI | Served and CSP-tested over HTTP, lint-checked (no `innerHTML`, no browser storage). **Not exercised in a real browser.** |
-| `npm install` | Not needed (no dependencies). The previous `@supabase/supabase-js` dependency was removed because the session's network policy blocks the npm registry. |
+| `npm run lint`, `npm run scan`, `npm test` | **Run locally, green** (142 pass / 2 skipped). GitHub Actions cannot run: the account's billing blocks the jobs (not a code failure). |
+| Concurrency, leases, fencing, crash windows, idempotent approvals, Supabase pagination | Defects D1–D6 of the audit reproduced red, fixed, covered by `test/reliability.test.js`, `test/recette.test.js` (two concurrent workers; real `SIGKILL` of a worker process). Mutation checks confirmed the tests fail when the fix is removed. |
+| MissionControl | **Exercised in real headless Chromium** (`test/e2e.test.js`, 5 tests): login, mission, approvals, blocked + resume, viewer read-only, reload and history. |
+| GitHub draft PR + CI feedback loop | Tested against a **simulated GitHub API** (`testkit/fake-github.js`) with a real bare git remote. **Never run against github.com.** |
+| `supabase/migrations/001–003` | Applied and tested on a **real local PostgreSQL 16** (`test/migrations.test.js`: RLS denial, append-only events, unique approval, rev guard, replay of real engine output). **Not applied to any Supabase project** (no dedicated project reachable with credentials from here). |
+| `SupabaseStore` over the network | Simulated PostgREST only. The opt-in live test (`test/supabase-live.test.js`) was **skipped**: no credentials. |
+| Real bubblewrap isolation test | **Skipped here**: `bwrap` is not installable in this environment. It stays mandatory in CI (`CTO_REQUIRE_SANDBOX_TESTS=1`). Do not treat the isolation as proven until it ran green somewhere. |
+| Real Claude invocation | Historical run: [docs/DEMO_EVIDENCE.md](docs/DEMO_EVIDENCE.md). No new spend was engaged; a real correction loop needs an approved budget. |
 
 ## Audit corrections
 
@@ -49,10 +52,10 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 
 ## Limitations
 - Authentication is two static bearer tokens (owner / viewer), not per-user accounts. Do not expose publicly; bind to localhost or put it behind an authenticating reverse proxy with TLS.
-- `FileStore` is single-process. The concurrency limit check is not atomic across several worker processes (use one worker or add a DB-side lock before scaling out).
-- Four specialists exist (architect, backend, QA, security). Frontend and DevOps agents are not implemented.
+- `FileStore` is single-process; use `SupabaseStore` for several workers (claim-then-verify slot protocol, covered by tests against the simulated PostgREST and the 003 guards on real PostgreSQL, but not against a live Supabase).
+- Four specialists exist (architect, backend, QA, security). Frontend, DevOps and a separate CTO quality-control agent are **not implemented** (engine reliability was prioritised).
 - QA and security verdicts come from an LLM reading code that another LLM wrote: they are advisory and can be manipulated. By design they can only add blockers; they never replace the CTO's own checks (git evidence, tests re-run, acceptance tests, secret scan).
-- The CTO prepares the branch and PR body locally; opening the GitHub PR and merging are left to the owner.
+- The CTO can push its task branch and open a **draft** PR (restricted GitHub client, allowlisted repositories). Merging and deploying are never done by the CTO.
 - `docs/01…06` are still empty templates, not approved specifications: they were not invented.
 - CI has no dependency audit or SAST step (there are no npm dependencies); actions are pinned by major tag, not by SHA.
 

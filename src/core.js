@@ -37,6 +37,12 @@ export function validateTransition(from, to, table = MISSION_TRANSITIONS) {
 
 export const validateTaskTransition = (from, to) => validateTransition(from, to, TASK_TRANSITIONS);
 
+/** `failed` is terminal for the engine. Only an explicit owner resume may reopen a failed task, and only to `queued`. */
+export function validateOwnerRetry(status) {
+  if (status !== 'failed') throw new Error(`Only a failed task can be retried, not ${status}`);
+  return 'queued';
+}
+
 /**
  * Specialist roles. `tools` is the Claude Code allowlist; everything else is denied because
  * the runner never prompts. `readOnly` roles must leave their worktree untouched.

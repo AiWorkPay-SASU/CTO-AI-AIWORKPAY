@@ -6,6 +6,7 @@ Le registre persistant de l'orchestrateur fera autorité ; ce fichier est une vu
 |---|---|---|---|---|---|---|---|---|
 | TASK-001 | CTO-AI-AIWORKPAY- | MVP v0.2: orchestrateur, 4 agents réels (architect, backend, QA, sécurité), file durable, MissionControl, tests | claude (session) | REVIEW | — | feat/cto-mvp-v1 / PR #1 | Fondateur | 2026-10-17 |
 | TASK-002 | CTO-AI-AIWORKPAY- | Projet Supabase de dev dédié + application/test de la migration (RLS) | — | BLOCKED | TASK-001 | — | Fondateur (coût) | 2026-10-17 |
+| TASK-004 | CTO-AI-AIWORKPAY- | Fiabilisation moteur (D1–D6), PR brouillon GitHub, E2E, migration 003 | claude (session) | REVIEW | TASK-001 | audit/cto-reliability-2026-10-26 | Fondateur | 2026-10-26 |
 | TASK-003 | CTO-AI-AIWORKPAY- | Authentification par utilisateur + TLS avant tout hébergement | — | BACKLOG | TASK-001 | — | Fondateur | 2026-10-17 |
 
 ## États
