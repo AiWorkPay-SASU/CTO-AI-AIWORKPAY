@@ -3,6 +3,7 @@
 (() => {
   let token = null;
   let role = null;
+  let github = false;
   let timer = null;
   const $ = (id) => document.getElementById(id);
 
@@ -52,6 +53,7 @@
     timer = null;
     token = null;
     role = null;
+    github = false;
     $('who').hidden = true;
   }
 
@@ -87,6 +89,53 @@
       el('button', { class: 'danger', onclick: () => decide('reject') }, 'Refuser'));
   }
 
+  const ACTIVE = ['approved', 'running', 'awaiting_owner', 'review', 'blocked'];
+
+  /** Budget raise (blocked or running missions) and explicit resume after an escalation. */
+  function recoveryControls(m) {
+    if (role !== 'owner') return '';
+    const nodes = [];
+    if (m.status === 'blocked') {
+      nodes.push(el('button', {
+        onclick: () => guarded(async () => { await api(`/api/missions/${m.id}/resume`, { method: 'POST', body: {} }); await refresh(); })
+      }, 'Reprendre'));
+    }
+    if (ACTIVE.includes(m.status) && m.budget_usd < 50) {
+      const input = el('input', {
+        type: 'number', min: String(m.budget_usd), max: '50', step: '0.5', value: String(Math.min(50, m.budget_usd * 2)),
+        'aria-label': 'Nouveau budget en USD'
+      });
+      nodes.push(input, el('button', {
+        onclick: () => guarded(async () => {
+          await api(`/api/missions/${m.id}/budget`, { method: 'POST', body: { budget_usd: Number(input.value) } });
+          await refresh();
+        })
+      }, 'Relever le budget'));
+    }
+    return nodes.length ? el('div', { class: 'row' }, ...nodes) : '';
+  }
+
+  /** Draft pull request and CI verdict. Merging is never offered: it stays a human action on GitHub. */
+  function pullRequestControls(m) {
+    if (role !== 'owner' || !github || !['review', 'completed'].includes(m.status)) return '';
+    if (!m.pull_request) {
+      return el('div', { class: 'row' }, el('button', {
+        onclick: () => guarded(async () => { await api(`/api/missions/${m.id}/pr`, { method: 'POST', body: {} }); await refresh(); })
+      }, 'Ouvrir la PR (brouillon)'));
+    }
+    const link = /^https:\/\//.test(m.pull_request.url ?? '')
+      ? el('a', { href: m.pull_request.url, target: '_blank', rel: 'noopener noreferrer' }, `PR #${m.pull_request.number}`)
+      : el('span', {}, `PR #${m.pull_request.number}`);
+    return el('div', { class: 'row' }, link, el('span', { class: 'muted' }, 'brouillon · fusion manuelle uniquement'),
+      el('button', {
+        onclick: () => guarded(async () => {
+          const ci = await api(`/api/missions/${m.id}/ci`, { method: 'POST', body: {} });
+          banner(`CI : ${ci.state} → ${ci.action}`, 'info');
+          await refresh();
+        })
+      }, 'Vérifier la CI'));
+  }
+
   async function loadDetails(m, box) {
     const events = await api(`/api/missions/${m.id}/events`);
     const report = await api(`/api/missions/${m.id}/report`);
@@ -100,11 +149,16 @@
       el('table', {}, ...events.map((e) => el('tr', {},
         el('td', { class: 'muted' }, e.at.slice(11, 19)), el('td', {}, e.type), el('td', { class: 'muted' }, e.actor),
         el('td', { class: 'muted' }, JSON.stringify(e.detail).slice(0, 160))))),
+      el('h3', {}, 'Livraison vérifiée'),
+      el('div', { class: 'row', id: `delivery-${m.id}` },
+        el('span', {}, report.branch ? `${report.branch} @ ${String(report.commit).slice(0, 12)}` : 'Aucun commit vérifié pour l’instant'),
+        report.tests ? el('span', { class: 'muted' }, `tests exécutés par le CTO : ${report.tests.passed} ok / ${report.tests.failed} ko`) : ''),
       el('h3', {}, 'Corps de PR proposé'),
       el('pre', {}, report.pull_request_body));
   }
 
   function renderMission(m) {
+    const roleOf = new Map(m.tasks.map((t) => [t.id, t.role]));
     const details = el('div', {});
     const box = el('details', {}, el('summary', {}, 'Rapports, audit, PR'), details);
     box.addEventListener('toggle', () => { if (box.open) guarded(() => loadDetails(m, details)); });
@@ -113,10 +167,13 @@
         el('span', { class: 'muted' }, `${m.spent_usd.toFixed(4)} / ${m.budget_usd} USD${m.estimated_usd ? ` (including ${m.estimated_usd.toFixed(4)} estimated)` : ''}`)),
       el('p', {}, m.objective),
       m.blockers?.length ? el('div', { class: 'row' }, badge('blocked'), ...m.blockers.map((b) => el('span', {}, b))) : '',
-      el('table', {}, el('tr', {}, ...['agent', 'état', 'tentatives', 'corrections', 'échecs'].map((h) => el('th', {}, h))),
-        ...m.tasks.map((t) => el('tr', {}, el('td', {}, t.role), el('td', {}, badge(t.status)),
+      el('table', {}, el('tr', {}, ...['agent', 'état', 'dépend de', 'tentatives', 'corrections', 'échecs'].map((h) => el('th', {}, h))),
+        ...m.tasks.map((t) => el('tr', { 'data-role': t.role }, el('td', {}, t.role), el('td', {}, badge(t.status)),
+          el('td', { class: 'muted' }, [roleOf.get(t.depends_on) ?? '—', t.requires_approval ? `+ approbation ${t.requires_approval}` : ''].filter(Boolean).join(' ')),
           el('td', {}, t.attempts), el('td', {}, t.corrections), el('td', {}, t.failures)))),
       approvalButtons(m),
+      recoveryControls(m),
+      pullRequestControls(m),
       !['completed', 'cancelled', 'failed'].includes(m.status) && role === 'owner'
         ? el('button', { class: 'danger', onclick: () => guarded(async () => { await api(`/api/missions/${m.id}/cancel`, { method: 'POST', body: {} }); await refresh(); }) }, 'Annuler')
         : '',
@@ -142,9 +199,11 @@
     token = $('token').value;
     $('token').value = '';
     guarded(async () => {
-      role = (await api('/api/whoami')).role;
+      const me = await api('/api/whoami');
+      role = me.role;
+      github = me.github;
       $('who').hidden = false;
-      $('who').textContent = `Connecté : ${role}`;
+      $('who').textContent = `Connecté : ${role} (jeton ${me.credential_id})`;
       await refresh();
       timer = setInterval(() => { if (!document.hidden) guarded(refresh); }, 3000);
     });

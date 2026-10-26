@@ -9,14 +9,19 @@ permissions:
 jobs:
   node:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Install test isolation runtime
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install test isolation runtime and PostgreSQL server binaries
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap postgresql
+      - name: Install browser for the MissionControl end-to-end tests (test tooling only, not a project dependency)
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e" && cd "$RUNNER_TEMP/e2e" && npm init -y >/dev/null && npm install playwright@1.49.1
+          npx playwright install --with-deps chromium
+          echo "NODE_PATH=$RUNNER_TEMP/e2e/node_modules" >> "$GITHUB_ENV"
       # The project has no runtime dependency; there is nothing to install.
       - name: Lint (syntax + repository rules)
         run: npm run lint
@@ -26,4 +31,6 @@ jobs:
         run: npm test
         env:
           CTO_REQUIRE_SANDBOX_TESTS: '1'
+          CTO_REQUIRE_BROWSER_TESTS: '1'
+          CTO_REQUIRE_PG_TESTS: '1'
 

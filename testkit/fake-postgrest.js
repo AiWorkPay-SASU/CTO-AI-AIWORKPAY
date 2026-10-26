@@ -12,7 +12,8 @@ export async function startFakePostgrest({ apiKey = 'test-service-key-0123456789
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://x');
     const table = url.pathname.replace('/rest/v1/', '');
-    requests.push({ method: req.method, table, query: url.search, headers: req.headers });
+    const entry = { method: req.method, table, query: url.search, headers: req.headers, body: null };
+    requests.push(entry);
     const reply = (status, body) => {
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(body === undefined ? '' : JSON.stringify(body));
@@ -20,6 +21,7 @@ export async function startFakePostgrest({ apiKey = 'test-service-key-0123456789
     if (req.headers.apikey !== apiKey || req.headers.authorization !== `Bearer ${apiKey}`) return reply(401, { message: 'bad key' });
     let raw = '';
     for await (const chunk of req) raw += chunk;
+    entry.body = raw ? JSON.parse(raw) : null;
     const rows = tables.get(table) ?? tables.set(table, []).get(table);
     const filters = [...url.searchParams.entries()].filter(([, v]) => v.startsWith('eq.'));
     const matches = (row) => filters.every(([k, v]) => String(row[k]) === decodeURIComponent(v.slice(3)));

@@ -127,7 +127,7 @@ export function createServer({
       if (role !== 'owner') throw new HttpError(403, 'Read-only token');
     }
 
-    if (pathname === '/api/whoami' && method === 'GET') return send(res, 200, { role });
+    if (pathname === '/api/whoami' && method === 'GET') return send(res, 200, { role, credential_id: identity.credentialId, github: Boolean(cto.github) });
     if (pathname === '/api/agents' && method === 'GET') {
       const running = await cto.store.list('tasks', { status: 'running' });
       return send(res, 200, Object.entries(ROLES).map(([name, def]) => ({

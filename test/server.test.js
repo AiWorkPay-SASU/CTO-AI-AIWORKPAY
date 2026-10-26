@@ -50,8 +50,12 @@ test('health is public; everything under /api needs a valid token', async (t) =>
   assert.equal((await call('/api/missions', { token: 'wrong' })).status, 401);
   assert.equal((await call('/api/missions', { token: `${ADMIN}x` })).status, 401);
   assert.equal((await call('/api/missions')).status, 200);
-  assert.deepEqual((await call('/api/whoami')).json, { role: 'owner' });
-  assert.deepEqual((await call('/api/whoami', { token: VIEWER })).json, { role: 'viewer' });
+  const owner = (await call('/api/whoami')).json;
+  const viewer = (await call('/api/whoami', { token: VIEWER })).json;
+  assert.deepEqual([owner.role, owner.github], ['owner', false]);
+  assert.equal(viewer.role, 'viewer');
+  assert.match(owner.credential_id, /^[0-9a-f]{8}$/);
+  assert.notEqual(owner.credential_id, viewer.credential_id);
 });
 
 test('security headers on API and UI responses', async (t) => {
