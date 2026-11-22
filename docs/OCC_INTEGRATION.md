@@ -12,3 +12,7 @@ Le CTO reste indépendant ; Open Cortex Code (`cortexAI-2025/open-cortex-code`, 
 - Correctif : un fichier ajouté puis supprimé par l'agent lors d'une correction ne reste plus signalé comme modifié.
 
 Preuve d'une exécution réelle : `docs/mission-pilote-cto.md` dans le dépôt Open Cortex Code.
+
+## Démarrage et prérequis
+`npm run setup:linux` installe bubblewrap (idempotent) et lance `npm run doctor` (Linux, Node ≥ 20, CLI `claude`, test réel de l'isolation ; code de sortie 1 = BLOCKED).
+`.env.example` liste la configuration. Open Cortex fournit `scripts/team-up.sh` pour lancer les deux services. Certification complète : `docs/certification-equipe-ia.md` côté Open Cortex Code.
