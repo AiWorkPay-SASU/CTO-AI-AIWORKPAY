@@ -28,13 +28,13 @@ CTO_ADMIN_TOKEN=<24+ chars> CTO_REPO_PATH=/path/to/repo npm start     # API + Mi
 ### API (all `/api` routes need `Authorization: Bearer <token>`)
 `GET /api/missions` · `POST /api/missions {project, objective, budget_usd?, acceptance?}` · `GET /api/missions/:id` ·
 `GET /api/missions/:id/events` · `GET /api/missions/:id/report` · `POST /api/missions/:id/approvals {kind: mission|architecture|completion, decision: approve|reject, note?}` ·
-`POST /api/missions/:id/budget {budget_usd}` · `POST /api/missions/:id/cancel` · `POST /api/missions/:id/run[?wait=1]` · `GET /api/agents` · `GET /api/whoami`.
+`POST /api/missions/:id/budget {budget_usd}` · `POST /api/missions/:id/cancel` · `POST /api/missions/:id/run[?wait=1]` · `POST /api/missions/:id/resume` · `GET /api/runtime` · `GET /api/agents` · `GET /api/whoami`. Intégration Open Cortex Code : [docs/OCC_INTEGRATION.md](docs/OCC_INTEGRATION.md) (`external_ref`, `scope`).
 `GET /health` is public. MissionControl is served on `/` (token kept in memory only).
 
 ## Verification status (what was really run, what was not)
 | Item | Status |
 |---|---|
-| `npm run lint`, `npm run scan`, `npm test` (93 tests) | **Run locally, green** (Node 22.22). GitHub Actions (`Tests` workflow) passed on the previous commits; the result for the latest push is shown in the PR checks. |
+| `npm run lint`, `npm run scan`, `npm test` (117 tests, 2 ignorés : Supabase live) | **Run locally, green** (Node 22.22). GitHub Actions (`Tests` workflow) passed on the previous commits; the result for the latest push is shown in the PR checks. |
 | Real Claude invocation on an isolated test repo with all four agents: objective → delegation → execution → report → CTO control → verified commit → parallel QA + security review | **Run, succeeded** — evidence in [docs/DEMO_EVIDENCE.md](docs/DEMO_EVIDENCE.md) |
 | Correction loop and review-triggered rework | Covered by tests with scripted agent doubles that modify real worktrees. **Not triggered in the live run** (every agent passed first time). |
 | Restart recovery, cancellation, retries, budget stop, approval gates, concurrency limit | Covered by tests (real git worktrees, real files; agents scripted) |
