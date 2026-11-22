@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { planMission, validateTransition, validateReport, ROLES, TERMINAL_MISSION, REVIEWER_ROLES } from './core.js';
+import {
+  planMission, validateTransition, validateReport, validateExternalRef, validateScope, outsideScope,
+  ROLES, TERMINAL_MISSION, REVIEWER_ROLES
+} from './core.js';
 import { JobQueue } from './queue.js';
 import { emit } from './events.js';
 import { runClaude } from './runner.js';
@@ -32,7 +35,8 @@ function validateAcceptance(acceptance) {
  */
 export class Cto {
   constructor({
-    store, runner = runClaude, testRunner = runTests, repoPath, workspacesDir, workerId = 'cto-worker-1', limits = {}
+    store, runner = runClaude, testRunner = runTests, repoPath, workspacesDir, workerId = 'cto-worker-1', limits = {},
+    preflight = null
   }) {
     if (!store) throw new Error('store required');
     if (!repoPath) throw new Error('repoPath required');
@@ -50,23 +54,56 @@ export class Cto {
       maxConcurrent: limits.maxConcurrent ?? 2,
       backoffMs: limits.backoffMs ?? 1000
     });
+    // Optional runtime check (Linux, Node, Claude CLI, bubblewrap). When it fails, nothing is dispatched: BLOCKED.
+    this.preflight = preflight;
     this.controllers = new Map();
     this.inflight = new Set();
     this.deciding = new Set();
+    this.creating = new Map();
     this.timer = null;
   }
 
   // ---------------------------------------------------------------- missions
 
-  async createMission({ objective, project, budgetUsd, acceptance }) {
+  /**
+   * Creates a mission. With `externalRef` the call is idempotent: a retry (network failure, caller restart)
+   * returns the existing mission instead of creating a second one, so the same work is never executed twice.
+   */
+  async createMission({ objective, project, budgetUsd, acceptance, externalRef, scope }) {
+    const ref = validateExternalRef(externalRef);
+    if (!ref) return this.#createMission({ objective, project, budgetUsd, acceptance, scope, ref });
+    // Serialize concurrent creations with the same key (the store itself offers no unique index).
+    const pending = this.creating.get(ref);
+    if (pending) return pending.then(() => this.getMissionByRef(ref));
+    const run = (async () => {
+      const existing = await this.getMissionByRef(ref);
+      if (existing) return existing;
+      return this.#createMission({ objective, project, budgetUsd, acceptance, scope, ref });
+    })();
+    this.creating.set(ref, run);
+    try {
+      return await run;
+    } finally {
+      this.creating.delete(ref);
+    }
+  }
+
+  async getMissionByRef(ref) {
+    const found = (await this.store.list('missions')).find((m) => m.external_ref === ref);
+    return found ? this.getMission(found.id) : null;
+  }
+
+  async #createMission({ objective, project, budgetUsd, acceptance, scope, ref }) {
     const plan = planMission(objective, project, {
       ...(budgetUsd === undefined ? {} : { budgetUsd }),
-      acceptance: validateAcceptance(acceptance)
+      acceptance: validateAcceptance(acceptance),
+      externalRef: ref,
+      scope: validateScope(scope)
     });
     const { tasks, ...mission } = plan;
     await this.store.insert('missions', mission);
     for (const task of tasks) await this.queue.enqueue(task);
-    await emit(this.store, { mission_id: mission.id, type: 'mission_created', detail: { project, tasks: tasks.map((t) => t.role) } });
+    await emit(this.store, { mission_id: mission.id, type: 'mission_created', detail: { project, tasks: tasks.map((t) => t.role), external_ref: ref, scope: mission.scope } });
     return this.getMission(mission.id);
   }
 
@@ -171,6 +208,40 @@ export class Cto {
     return this.getMission(missionId);
   }
 
+  /**
+   * Resumes an interrupted mission without duplicating work. A blocked mission is released only if the runtime
+   * checks pass again and no task failed permanently; running or waiting missions are left untouched (the durable
+   * queue already guarantees one lease per task, so nothing can be executed twice).
+   */
+  async resume(missionId, { by = 'owner' } = {}) {
+    const mission = await this.#mission(missionId);
+    if (TERMINAL_MISSION.has(mission.status)) throw new Error(`Mission already ${mission.status}`);
+    if (mission.status !== 'blocked') return this.getMission(missionId);
+    if (this.preflight) {
+      const pf = await this.preflight({ force: true });
+      if (!pf.ok) throw Object.assign(new Error(`BLOCKED: ${pf.blockers.join('; ')}`), { status: 409, blocked: true });
+    }
+    const tasks = await this.store.list('tasks', { mission_id: missionId });
+    const failed = tasks.filter((t) => t.status === 'failed');
+    if (failed.length) {
+      throw Object.assign(new Error(`Cannot resume: task(s) failed permanently (${failed.map((t) => t.role).join(', ')}). Create a new mission.`), { status: 409 });
+    }
+    await this.#setMission(mission, 'running', { blockers: [] });
+    await emit(this.store, { mission_id: missionId, type: 'mission_resumed', actor: by, detail: {} });
+    return this.getMission(missionId);
+  }
+
+  /** Without a working isolated runtime nothing is dispatched: affected missions are marked BLOCKED, never simulated. */
+  async #blockOnPreflight() {
+    if (!this.preflight) return false;
+    const pf = await this.preflight();
+    if (pf.ok) return false;
+    for (const mission of await this.store.list('missions')) {
+      if (['approved', 'running'].includes(mission.status)) await this.#block(mission.id, `BLOCKED: ${pf.blockers.join('; ')}`);
+    }
+    return true;
+  }
+
   async cleanup(missionId) {
     const tasks = await this.store.list('tasks', { mission_id: missionId });
     for (const t of tasks) {
@@ -220,6 +291,7 @@ export class Cto {
 
   /** Launches every dispatchable task up to the concurrency limit. Returns how many were started. */
   async tick({ wait = false } = {}) {
+    if (await this.#blockOnPreflight()) return 0;
     const recovered = await this.queue.recoverExpired();
     for (const { id } of recovered) {
       const task = await this.store.get('tasks', id);
@@ -456,6 +528,8 @@ export class Cto {
     if (!ev.changed_files.length) problems.push('No file was changed: nothing to verify, the claim of completion is unsupported');
     const forbidden = forbiddenChanges(ev.changed_files);
     if (forbidden.length) problems.push(`Forbidden paths modified: ${forbidden.join(', ')}. Revert them.`);
+    const outOfScope = outsideScope(ev.changed_files, mission.scope);
+    if (outOfScope.length) problems.push(`Files outside the mission scope (${mission.scope.join(', ')}): ${outOfScope.join(', ')}. Revert them.`);
     if (ev.secret_in_diff) problems.push('A secret-like value was found in the changes. Remove it.');
 
     let tests = { passed: 0, failed: 0 };
@@ -484,6 +558,8 @@ export class Cto {
     if (beforeTests !== verifiedTree) problems.push('Workspace changed during test execution; results do not verify the final tree');
     const finalForbidden = forbiddenChanges(staged.files);
     if (finalForbidden.length) problems.push(`Forbidden paths in final staged tree: ${finalForbidden.join(', ')}`);
+    const finalOutOfScope = outsideScope(staged.files, mission.scope);
+    if (finalOutOfScope.length) problems.push(`Files outside the mission scope in final staged tree: ${finalOutOfScope.join(', ')}`);
     if (staged.secret) problems.push('A secret-like value was found in the final staged tree');
     ev.changed_files = staged.files;
     let commit = null;
@@ -630,8 +706,23 @@ export class Cto {
       const r = accepted.filter((x) => x.role === role).at(-1);
       return r?.evidence?.review ? [{ role, verdict: r.evidence.review.verdict, findings: r.evidence.review.findings, blocking: r.evidence.review.blocking }] : [];
     });
+    const costs = await this.store.list('costs', { mission_id: missionId });
+    const costByRole = {};
+    for (const c of costs) costByRole[c.role] = Math.round(((costByRole[c.role] ?? 0) + c.usd) * 1e6) / 1e6;
+    const ev = backend?.evidence;
     const report = {
-      mission: { id: mission.id, project: mission.project, objective: mission.objective, status: mission.status, budget_usd: mission.budget_usd, spent_usd: mission.spent_usd, estimated_usd: mission.estimated_usd },
+      mission: {
+        id: mission.id, project: mission.project, objective: mission.objective, status: mission.status,
+        budget_usd: mission.budget_usd, spent_usd: mission.spent_usd, estimated_usd: mission.estimated_usd,
+        external_ref: mission.external_ref ?? null, scope: mission.scope ?? null
+      },
+      cost_by_role: costByRole,
+      git: ev ? {
+        branch: ev.branch, commit: ev.commit, base_commit: mission.tasks.find((t) => t.role === 'backend')?.base_commit ?? null,
+        files: ev.branch_files ?? ev.changed_files ?? [], diffstat: ev.branch_diffstat ?? ev.diffstat ?? '',
+        pushed: false, merged: false
+      } : null,
+      acceptance_tests: ev?.acceptance ?? null,
       tasks: mission.tasks.map((t) => ({ role: t.role, status: t.status, attempts: t.attempts, corrections: t.corrections, failures: t.failures })),
       approvals: mission.approvals.map((a) => ({ kind: a.kind, decision: a.decision, by: a.by, at: a.at })),
       pending_approvals: pending,

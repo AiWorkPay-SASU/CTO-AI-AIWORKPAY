@@ -88,7 +88,7 @@ const PROJECT_RE = /^[A-Za-z0-9][A-Za-z0-9-]*\/(?!\.{1,2}$)[A-Za-z0-9_.-]+$/;
  * Builds a mission with its two initial tasks. The mission starts pending owner approval,
  * the backend task waits for the architect and for the owner's architecture approval.
  */
-export function planMission(objective, project, { budgetUsd = DEFAULT_BUDGET_USD, acceptance = null } = {}) {
+export function planMission(objective, project, { budgetUsd = DEFAULT_BUDGET_USD, acceptance = null, externalRef = null, scope = null } = {}) {
   if (typeof objective !== 'string' || !objective.trim() || !project) {
     throw new Error('Objective and project required');
   }
@@ -123,6 +123,8 @@ export function planMission(objective, project, { budgetUsd = DEFAULT_BUDGET_USD
     budget_usd: budgetUsd,
     spent_usd: 0,
     acceptance,
+    external_ref: externalRef,
+    scope,
     created_at: created,
     tasks: [
       {
@@ -153,6 +155,38 @@ export function planMission(objective, project, { budgetUsd = DEFAULT_BUDGET_USD
       reviewTask('security', `Audit the security of the implementation of: ${cleanObjective}`)
     ]
   };
+}
+
+/** Caller-supplied idempotency key (e.g. the id a front-end gave the mission). */
+const EXTERNAL_REF_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{7,127}$/;
+
+export function validateExternalRef(ref) {
+  if (ref == null) return null;
+  if (typeof ref !== 'string' || !EXTERNAL_REF_RE.test(ref)) throw new Error('external_ref must be 8-128 chars of [A-Za-z0-9_.:-]');
+  return ref;
+}
+
+/**
+ * Optional write scope: repository-relative path prefixes the backend may change. Anything else it
+ * touches is a verification problem. Absolute paths, `..`, backslashes and control characters are refused.
+ */
+export function validateScope(scope) {
+  if (scope == null) return null;
+  if (!Array.isArray(scope) || scope.length === 0 || scope.length > 20) throw new Error('scope must be 1-20 path prefixes');
+  return scope.map((entry) => {
+    if (typeof entry !== 'string' || entry.length > 200 || /[\\\u0000-\u001F]/.test(entry)) throw new Error('Invalid scope entry');
+    const cleaned = entry.replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!cleaned || cleaned.startsWith('/') || cleaned.split('/').some((part) => part === '..' || part === '' || part === '.')) {
+      throw new Error(`Invalid scope entry "${entry}"`);
+    }
+    return cleaned;
+  });
+}
+
+/** Files outside every allowed prefix (a prefix matches the file itself or a directory containing it). */
+export function outsideScope(files, scope) {
+  if (!scope) return [];
+  return files.filter((f) => !scope.some((prefix) => f === prefix || f.startsWith(`${prefix}/`)));
 }
 
 const REPORT_STATUSES = new Set(['IN_PROGRESS', 'REVIEW', 'DONE', 'BLOCKED', 'FAILED']);
