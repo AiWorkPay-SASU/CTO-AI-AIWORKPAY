@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ROLES } from './core.js';
 import { Cto } from './cto.js';
 import { storeFromEnv } from './store/index.js';
+import { cachedPreflight } from './preflight.js';
 import { safeEqual, redact } from './util.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -123,6 +124,11 @@ export function createServer({
     }
 
     if (pathname === '/api/whoami' && method === 'GET') return send(res, 200, { role });
+    if (pathname === '/api/runtime' && method === 'GET') {
+      // Real runtime checks (Linux, Node, Claude CLI, bubblewrap). `force=1` bypasses the short cache.
+      const preflight = cto.preflight ? await cto.preflight({ force: url.searchParams.get('force') === '1' }) : null;
+      return send(res, 200, { api: 'cto-ai/1', repo_path: fs.realpathSync(cto.repoPath), preflight });
+    }
     if (pathname === '/api/agents' && method === 'GET') {
       const running = await cto.store.list('tasks', { status: 'running' });
       return send(res, 200, Object.entries(ROLES).map(([name, def]) => ({
@@ -130,16 +136,27 @@ export function createServer({
         capabilities: def.capabilities,
         read_only: def.readOnly,
         max_budget_usd: def.maxBudgetUsd,
+        state: running.some((t) => t.role === name) ? 'busy' : 'idle',
         running_tasks: running.filter((t) => t.role === name).map((t) => ({ id: t.id, mission_id: t.mission_id }))
       })));
     }
-    if (pathname === '/api/missions' && method === 'GET') return send(res, 200, await cto.listMissions());
+    if (pathname === '/api/missions' && method === 'GET') {
+      const ref = url.searchParams.get('external_ref');
+      if (ref) {
+        const found = await cto.getMissionByRef(ref);
+        return send(res, 200, found ? [found] : []);
+      }
+      return send(res, 200, await cto.listMissions());
+    }
     if (pathname === '/api/missions' && method === 'POST') {
       const body = await readJson(req);
+      const existing = typeof body.external_ref === 'string' ? await cto.getMissionByRef(body.external_ref) : null;
       const mission = await cto.createMission({
-        objective: body.objective, project: body.project, budgetUsd: body.budget_usd, acceptance: body.acceptance
+        objective: body.objective, project: body.project, budgetUsd: body.budget_usd, acceptance: body.acceptance,
+        externalRef: body.external_ref, scope: body.scope
       });
-      return send(res, 201, mission);
+      // 200 + idempotent_replay: the same external_ref was already accepted, nothing new was created or started.
+      return send(res, existing ? 200 : 201, existing ? { ...mission, idempotent_replay: true } : mission);
     }
 
     const m = pathname.match(/^\/api\/missions\/([^/]+)(?:\/([a-z]+))?$/);
@@ -164,6 +181,14 @@ export function createServer({
       return send(res, 200, await cto.approve(id, { kind: body.kind, decision: body.decision, note: body.note, by: role }));
     }
     if (action === 'budget') return send(res, 200, await cto.raiseBudget(id, body.budget_usd, { by: role }));
+    if (action === 'resume') {
+      try {
+        return send(res, 200, await cto.resume(id, { by: role }));
+      } catch (error) {
+        if (error.blocked) return send(res, 409, { error: redact(error.message), status: 'BLOCKED' });
+        throw error;
+      }
+    }
     if (action === 'cancel') return send(res, 200, await cto.cancelMission(id, { by: role, reason: body.reason ?? 'cancelled by owner' }));
     if (action === 'run') {
       if (!(await cto.store.get('missions', id))) throw new HttpError(404, 'Not found');
@@ -196,6 +221,7 @@ export function ctoFromEnv(env = process.env) {
     store: storeFromEnv(env),
     repoPath: env.CTO_REPO_PATH || process.cwd(),
     workspacesDir: env.CTO_WORKSPACES_DIR,
+    preflight: env.CTO_PREFLIGHT === '0' ? null : cachedPreflight(),
     limits: { maxConcurrent: Number(env.CTO_MAX_CONCURRENT || 2) }
   });
 }

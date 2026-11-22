@@ -67,12 +67,14 @@ export async function removeWorkspace(repoPath, ws) {
 
 /** Real change evidence taken from git, never from the agent's own claims. */
 export async function collectEvidence(ws) {
-  const status = await git(ws.path, ['status', '--porcelain', '--untracked-files=all']);
+  // Re-stage first: a file the agent added and then removed during a correction round must disappear from the
+  // evidence (otherwise a stale index entry keeps it listed as changed forever).
+  await git(ws.path, ['add', '-A']);
+  const status = await git(ws.path, ['status', '--porcelain', '--untracked-files=all', '--no-renames']);
   const files = status.stdout
     .split('\n')
     .filter(Boolean)
     .map((line) => line.slice(3).trim().replace(/^"|"$/g, ''));
-  await git(ws.path, ['add', '-N', '.']); // intent-to-add so untracked files show in the diff stat
   const stat = await git(ws.path, ['diff', '--stat', 'HEAD']);
   // Untracked files are invisible to `git diff`; include their content for the secret scan.
   let diffText = (await git(ws.path, ['diff', 'HEAD'])).stdout;

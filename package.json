@@ -10,7 +10,9 @@
     "lint": "node scripts/lint.js",
     "scan": "node scripts/scan-secrets.js",
     "check": "npm run lint && npm run scan && npm test",
-    "demo": "node scripts/demo.js"
+    "demo": "node scripts/demo.js",
+    "doctor": "node scripts/doctor.js",
+    "setup:linux": "bash scripts/setup-linux.sh"
   },
   "engines": {
     "node": ">=20"
