@@ -1,0 +1,5 @@
+{
+  "server": { "repository": "https://github.com/AiWorkPay-SASU/aiworkpay-mcp-server", "branch": "main", "commit": "37b9150b0b6e53b1b5f3513dfcd772379b1e694c", "version": "0.7.0", "name": "aiworkpay" },
+  "sdk": { "package": "@modelcontextprotocol/sdk", "version": "1.32.2", "audit": "2026-11-24: npm audit --omit=dev = 0 vulnerabilities; MIT; no install scripts; 95 packages. Version 1.32.1 (used by the server) had 2 moderate advisories in transitive hono packages (server-side HTTP transport only, not used by a stdio client)." },
+  "note": "Changing the pinned server commit requires regenerating tools.manifest.json (node scripts/gen-mcp-manifest.js) and a human review of the diff."
+}

@@ -1,0 +1,141 @@
+{
+  "server": {
+    "repository": "https://github.com/AiWorkPay-SASU/aiworkpay-mcp-server",
+    "branch": "main",
+    "commit": "37b9150b0b6e53b1b5f3513dfcd772379b1e694c",
+    "version": "0.7.0",
+    "name": "aiworkpay"
+  },
+  "tools": {
+    "approve_result": {
+      "class": "authority",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "684597fea1fe29672704ec95ddf471c60b2297ed94c3f1887a19eb1edb929195"
+    },
+    "cancel_mission": {
+      "class": "delegate",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "684597fea1fe29672704ec95ddf471c60b2297ed94c3f1887a19eb1edb929195"
+    },
+    "create_mission": {
+      "class": "delegate",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "a6d70d6cb2378bfe8a87d296382c3384aa7ed55b0e2cf57370d0651eba9146d3"
+    },
+    "get_account": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "7a014b717a77aac971ea0ab5c0ff47bb13e6cae7ef9442d9dedb15ce36381b15"
+    },
+    "get_mission": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "0143f3ba83eafd25de88a51d460d2bde13b3f1349ba01325acb3d30844c60a4a"
+    },
+    "get_mission_result": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "0143f3ba83eafd25de88a51d460d2bde13b3f1349ba01325acb3d30844c60a4a"
+    },
+    "get_mission_status": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "0143f3ba83eafd25de88a51d460d2bde13b3f1349ba01325acb3d30844c60a4a"
+    },
+    "get_proof_file": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "ad30d4267e81b74e66a4f6bd7f96f82e78ee8523203df1ec0f717fa7e474b9b6"
+    },
+    "get_workforce_handoff": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "880d912433a6c5c0967a136aeac785e0ecbf53239129924a5bac2d318ba49021"
+    },
+    "list_missions": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "1bf67a056b9fba35c93b8d5ec33e1db28ab084e78ee247ae81f62cbd43c112d2"
+    },
+    "list_transactions": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "4f106e9b8f3441bb3941216de579b10362f1ade85f852a1c7a85cddadf863806"
+    },
+    "prepare_workforce_handoff": {
+      "class": "read",
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "ec7e798d3f14962f1bc0c31f637e83eaf21364bc6c4f743192f9f68fffc63389"
+    },
+    "request_changes": {
+      "class": "authority",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "inputSchemaHash": "104c449052f5b758a8cb65998e05445945fbbf1e8c83da73c8acec6a8045c984"
+    }
+  }
+}
