@@ -6,6 +6,9 @@ import { ROLES } from './core.js';
 import { Cto } from './cto.js';
 import { storeFromEnv } from './store/index.js';
 import { cachedPreflight } from './preflight.js';
+import { humanFromEnv } from './human/index.js';
+import { HumanError } from './human/errors.js';
+import { BriefError } from './human/brief.js';
 import { safeEqual, redact } from './util.js';
 
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'public');
@@ -75,7 +78,7 @@ async function readJson(req) {
  * the optional viewer token is read-only. Browser credentials are never stored by the UI.
  */
 export function createServer({
-  cto, adminToken, viewerToken = null, requestsPerMinute = 240, failedAuthPerMinute = 10
+  cto, human = null, adminToken, viewerToken = null, requestsPerMinute = 240, failedAuthPerMinute = 10
 }) {
   if (!adminToken || adminToken.length < 24) throw new Error('CTO_ADMIN_TOKEN (24+ chars) required');
   if (viewerToken && viewerToken.length < 24) throw new Error('CTO_VIEWER_TOKEN must be 24+ chars');
@@ -98,6 +101,39 @@ export function createServer({
     if (safeEqual(token, adminToken)) return 'owner';
     if (viewerToken && safeEqual(token, viewerToken)) return 'viewer';
     return null;
+  };
+
+  // The payment link is a bearer-like Stripe page: only the owner ever receives it.
+  const viewOf = (d, role) => (role === 'owner' ? d : { ...d, payment_url: undefined, payment_url_expires_at: undefined });
+
+  const routeDelegations = async (req, res, url, role) => {
+    if (!human) throw new HttpError(404, 'Human delegation is not configured');
+    const method = req.method;
+    const m = url.pathname.match(/^\/api\/delegations(?:\/([^/]+)(?:\/([a-z]+))?)?$/);
+    if (!m) throw new HttpError(404, 'Not found');
+    const [, id, action] = m;
+    if (id && !ID_RE.test(id)) throw new HttpError(400, 'Invalid delegation id');
+    try {
+      if (!id && method === 'GET') return send(res, 200, (await human.list({ mission_id: url.searchParams.get('mission_id') || undefined })).map((d) => viewOf(d, role)));
+      if (!id && method === 'POST') {
+        const body = await readJson(req);
+        if (typeof body.mission_id === 'string' && !ID_RE.test(body.mission_id)) throw new HttpError(400, 'Invalid mission id');
+        return send(res, 201, viewOf(await human.create({ brief: body.brief, mission_id: body.mission_id ?? null, by: role }), role));
+      }
+      if (id && !action && method === 'GET') return send(res, 200, viewOf(await human.get(id), role));
+      if (id && method === 'POST') {
+        const body = await readJson(req);
+        if (action === 'approval') return send(res, 200, viewOf(await human.approve(id, { decision: body.decision, brief_hash: body.brief_hash, note: body.note, by: role }), role));
+        if (action === 'cancel') return send(res, 200, viewOf(await human.cancel(id, { by: role }), role));
+        if (action === 'refresh') return send(res, 200, viewOf(await human.refresh(id, { force: true }), role));
+        if (action === 'review') return send(res, 200, viewOf(await human.review(id, { verdict: body.verdict, note: body.note, by: role }), role));
+      }
+    } catch (error) {
+      if (error instanceof BriefError) return send(res, 400, { error: redact(error.message), code: error.code, problems: error.problems });
+      if (error instanceof HumanError) return send(res, error.http, { error: redact(error.message), code: error.code, ...(error.reasons ? { reasons: error.reasons } : {}) });
+      throw error;
+    }
+    throw new HttpError(404, 'Not found');
   };
 
   const route = async (req, res, url) => {
@@ -124,6 +160,10 @@ export function createServer({
     }
 
     if (pathname === '/api/whoami' && method === 'GET') return send(res, 200, { role });
+    if (pathname === '/api/human/status' && method === 'GET') {
+      return send(res, 200, human ? await human.status() : { enabled: false, disabled_reasons: ['human delegation is not configured'] });
+    }
+    if (pathname.startsWith('/api/delegations')) return routeDelegations(req, res, url, role);
     if (pathname === '/api/runtime' && method === 'GET') {
       // Real runtime checks (Linux, Node, Claude CLI, bubblewrap). `force=1` bypasses the short cache.
       const preflight = cto.preflight ? await cto.preflight({ force: url.searchParams.get('force') === '1' }) : null;
@@ -228,15 +268,22 @@ export function ctoFromEnv(env = process.env) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const cto = ctoFromEnv();
+  const human = await humanFromEnv(cto.store);
   const server = createServer({
-    cto, adminToken: process.env.CTO_ADMIN_TOKEN, viewerToken: process.env.CTO_VIEWER_TOKEN || null
+    cto, human, adminToken: process.env.CTO_ADMIN_TOKEN, viewerToken: process.env.CTO_VIEWER_TOKEN || null
   });
+  if (human.config.enabled) {
+    // Finish uncertain submissions (by replay, never a duplicate) and follow active delegations.
+    human.recover().catch((e) => console.error('human recover failed:', redact(e.message)));
+    setInterval(() => human.recover().catch((e) => console.error('human poll failed:', redact(e.message))), Math.max(60000, human.config.pollMinMs)).unref();
+  }
   const port = Number(process.env.PORT || 3000);
   const host = process.env.HOST || '127.0.0.1';
   server.listen(port, host, () => console.log(`CTO API listening on ${host}:${port}`));
   if (process.env.CTO_WORKER !== '0') cto.startWorker();
   const stop = async () => {
     server.close();
+    await human.port.close?.();
     await cto.stopWorker({ waitForTasks: false });
     process.exit(0);
   };

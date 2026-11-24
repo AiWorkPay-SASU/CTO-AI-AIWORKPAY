@@ -11,7 +11,8 @@ const TABLE_NAMES = Object.freeze({
   reports: 'cto_reports',
   events: 'cto_events',
   approvals: 'cto_approvals',
-  costs: 'cto_costs'
+  costs: 'cto_costs',
+  delegations: 'cto_delegations'
 });
 
 const enc = encodeURIComponent;

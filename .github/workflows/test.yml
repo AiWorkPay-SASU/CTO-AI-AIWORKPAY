@@ -27,3 +27,27 @@ jobs:
         env:
           CTO_REQUIRE_SANDBOX_TESTS: '1'
 
+  human-loop-mcp:
+    # Real aiworkpay-mcp-server (pinned commit) against the SIMULATED backend API: no real service, no money.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build the pinned MCP server
+        run: |
+          COMMIT=$(node -p "require('./integrations/aiworkpay/MCP_PIN.json').server.commit")
+          git clone https://github.com/AiWorkPay-SASU/aiworkpay-mcp-server "$RUNNER_TEMP/mcp"
+          git -C "$RUNNER_TEMP/mcp" checkout "$COMMIT"
+          npm ci --prefix "$RUNNER_TEMP/mcp" --ignore-scripts
+          npm run build --prefix "$RUNNER_TEMP/mcp"
+          echo "AIWORKPAY_MCP_DIR=$RUNNER_TEMP/mcp" >> "$GITHUB_ENV"
+      - name: Install the isolated MCP client and audit it
+        run: |
+          npm ci --prefix integrations/aiworkpay --ignore-scripts
+          npm audit --omit=dev --prefix integrations/aiworkpay
+      - name: Contract + integration tests
+        run: node --test test/human-mcp.integration.test.js test/human-delegations.test.js test/human-core.test.js test/human-server.test.js
+

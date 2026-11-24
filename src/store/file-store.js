@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-export const TABLES = Object.freeze(['missions', 'tasks', 'reports', 'events', 'approvals', 'costs']);
+export const TABLES = Object.freeze(['missions', 'tasks', 'reports', 'events', 'approvals', 'costs', 'delegations']);
 
 /**
  * Durable single-process store: one JSON state file written atomically (tmp + rename).

@@ -1,0 +1,11 @@
+{
+  "name": "cto-aiworkpay-mcp-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Isolated MCP client of the CTO IA for the AIWORKPAY MCP server. The only npm dependency of the project, pinned exactly (D2).",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2"
+  }
+}
